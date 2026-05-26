@@ -1,0 +1,12 @@
+login --user=Manufacturer --pwd=df4fe8a8bcd5c95cdb640aa9793bb32b
+
+机械臂CLI指令
+    #回到初始姿态
+        m_init -p=0/1/2/3/4
+
+    #位置跟踪
+        ptr -t=1/8/20/21/17/25
+
+    #vr
+     
+    
