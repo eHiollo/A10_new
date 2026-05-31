@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "a10_tcp_server.hpp"
+#include "a10_teleop_tcp_plan.hpp"
 
 extern A10TcpServer* g_tcp_server;
 
@@ -510,11 +511,12 @@ auto A10PolicyTcpCliStop::prepareNrt() -> void
 auto A10PolicyTcpCliStop::executeRT() -> int
 {
     g_a10_policy_tcp_stop_requested.store(true, std::memory_order_release);
+    request_vr_teleop_stop();
     if (g_tcp_server != nullptr)
     {
         g_tcp_server->clear_policy_tcp_targets_nrt();
     }
-    mout() << "stop: 已请求结束 policy 驱动并清空 TCP batch/target" << std::endl;
+    mout() << "stop: 已请求结束 policy/vr 驱动并清空 TCP 缓冲" << std::endl;
     return 0;
 }
 

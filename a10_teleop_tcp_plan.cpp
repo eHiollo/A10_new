@@ -18,7 +18,6 @@ namespace a10_tcp
 {
 namespace
 {
-constexpr int k_aris_id = 0;
 constexpr int k_joint_num = 6;
 constexpr int k_motor_base = 0;
 constexpr double k_dt = 0.002;
@@ -44,23 +43,95 @@ double wrap_near(double ref, double raw)
     return ref + d;
 }
 
-void apply_vr_delta_to_pm(
-    double* target_pm,
-    const std::vector<double>& delta,
-    double pos_scale,
-    double rot_scale)
+/** 在「上一拍目标」上叠加 VR 增量，避免把实机抖动回灌到目标轨迹。 */
+void apply_vr_delta_from_target(double* target_pm, const std::vector<double>& delta)
 {
     double pe[6]{};
     rtb::math::pm2pe(target_pm, pe);
+
+    constexpr double k_trans_dz = 0.001;
+    constexpr double k_rot_dz_deg = 0.5;
+    constexpr double k_max_trans_step = 0.015;
+    constexpr double k_max_rot_step_deg = 3.0;
+
     for (int i = 0; i < 3 && i < static_cast<int>(delta.size()); ++i)
     {
-        pe[i] += delta[static_cast<std::size_t>(i)] * pos_scale;
+        double d = delta[static_cast<std::size_t>(i)];
+        if (std::abs(d) < k_trans_dz)
+        {
+            d = 0.0;
+        }
+        if (d > k_max_trans_step)
+        {
+            d = k_max_trans_step;
+        }
+        if (d < -k_max_trans_step)
+        {
+            d = -k_max_trans_step;
+        }
+        pe[i] += d;
     }
     for (int i = 3; i < 6 && i < static_cast<int>(delta.size()); ++i)
     {
-        pe[i] = wrap_near(pe[i], pe[i] + delta[static_cast<std::size_t>(i)] * k_deg2rad * rot_scale);
+        double d_deg = delta[static_cast<std::size_t>(i)];
+        if (std::abs(d_deg) < k_rot_dz_deg)
+        {
+            d_deg = 0.0;
+        }
+        if (d_deg > k_max_rot_step_deg)
+        {
+            d_deg = k_max_rot_step_deg;
+        }
+        if (d_deg < -k_max_rot_step_deg)
+        {
+            d_deg = -k_max_rot_step_deg;
+        }
+        pe[i] = wrap_near(pe[i], pe[i] + d_deg * k_deg2rad);
     }
     rtb::math::pe2pm(pe, target_pm);
+}
+
+bool is_effective_delta(const std::vector<double>& delta)
+{
+    if (delta.size() < 6)
+    {
+        return false;
+    }
+    constexpr double k_pos_eps = 5e-5;       // 0.05 mm
+    constexpr double k_rot_eps_deg = 0.05;   // 0.05 deg
+    for (int i = 0; i < 3; ++i)
+    {
+        if (std::abs(delta[static_cast<std::size_t>(i)]) > k_pos_eps)
+        {
+            return true;
+        }
+    }
+    for (int i = 3; i < 6; ++i)
+    {
+        if (std::abs(delta[static_cast<std::size_t>(i)]) > k_rot_eps_deg)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void pm_pose_error(const double* pm_ref, const double* pm_now, double& pos_err, double& rot_err)
+{
+    double pe_ref[6]{};
+    double pe_now[6]{};
+    rtb::math::pm2pe(const_cast<double*>(pm_ref), pe_ref);
+    rtb::math::pm2pe(const_cast<double*>(pm_now), pe_now);
+    pos_err = 0.0;
+    rot_err = 0.0;
+    for (int i = 0; i < 3; ++i)
+    {
+        pos_err = std::max(pos_err, std::abs(pe_ref[i] - pe_now[i]));
+    }
+    for (int i = 3; i < 6; ++i)
+    {
+        rot_err = std::max(rot_err, std::abs(wrap_near(pe_now[i], pe_ref[i]) - pe_now[i]));
+    }
 }
 
 }  // namespace
@@ -78,9 +149,7 @@ void request_vr_teleop_stop()
 
 struct A10TeleopTcpDriver::Imp
 {
-    rtb::core::RobotInterface ri;
     rtb::plan::SE3Follower follower;
-    rtb::plan::SingleAxisFollower joint_followers[k_joint_num];
 
     double target_pm[16]{};
     double next_T_base_to_ee[16]{};
@@ -92,56 +161,20 @@ struct A10TeleopTcpDriver::Imp
     double output_joints[k_joint_num]{};
     std::uint64_t consumed_ee_delta_seq_{0};
     bool inited_{false};
+    int no_effective_delta_ticks_{0};
 
-    double max_lin_vel_{0.05};
-    double max_lin_acc_{5.0};
-    double max_ang_vel_{1.0};
-    double max_ang_acc_{10.0};
-    double max_joint_vel_{0.35};
-    double max_joint_acc_{2.0};
-    double pos_scale_{1.0};
-    double rot_scale_{1.0};
+    double max_lin_vel_{0.03};
+    double max_lin_acc_{0.5};
+    double max_ang_vel_{0.4};
+    double max_ang_acc_{1.0};
 
-    void setup_joint_followers()
+    void apply_joints_to_motors(aris::plan::Plan& plan)
     {
+        auto& motors = plan.controller()->motorPool();
         for (int i = 0; i < k_joint_num; ++i)
         {
-            joint_followers[i].setDt(k_dt);
-            joint_followers[i].setMaxVel(max_joint_vel_);
-            joint_followers[i].setMaxAcc(max_joint_acc_);
+            motors[k_motor_base + i].setTargetPos(output_joints[i]);
         }
-    }
-
-    void init_joint_followers_from_current()
-    {
-        for (int i = 0; i < k_joint_num; ++i)
-        {
-            joint_followers[i].setFollow(current_joints[i], 0.0);
-            joint_followers[i].setTarget(current_joints[i], 0.0);
-        }
-        std::memcpy(output_joints, current_joints, sizeof(output_joints));
-        std::memcpy(ik_joints, current_joints, sizeof(ik_joints));
-    }
-
-    void set_joint_targets_from_ik()
-    {
-        for (int i = 0; i < k_joint_num; ++i)
-        {
-            joint_followers[i].setTarget(wrap_near(output_joints[i], ik_joints[i]), 0.0);
-        }
-    }
-
-    void track_joints_and_apply()
-    {
-        for (int i = 0; i < k_joint_num; ++i)
-        {
-            double pos = 0.0;
-            double vel = 0.0;
-            double acc = 0.0;
-            joint_followers[i].moveDtAndGetResult(pos, vel, acc);
-            output_joints[i] = pos;
-        }
-        ri.setJoints(k_aris_id, output_joints);
     }
 };
 
@@ -149,6 +182,7 @@ auto A10TeleopTcpDriver::prepareNrt() -> void
 {
     imp_->inited_ = false;
     imp_->consumed_ee_delta_seq_ = 0;
+    imp_->no_effective_delta_ticks_ = 0;
     g_a10_teleop_tcp_stop_requested.store(false, std::memory_order_release);
 
     for (auto& m : motorOptions())
@@ -157,53 +191,10 @@ auto A10TeleopTcpDriver::prepareNrt() -> void
     }
 
     imp_->follower.setDt(k_dt);
-    imp_->setup_joint_followers();
-
-    imp_->ri.setGetJointsFunc(k_aris_id, [this](double* q) {
-        auto& motors = controller()->motorPool();
-        for (int i = 0; i < k_joint_num; ++i)
-        {
-            q[i] = motors[k_motor_base + i].actualPos();
-        }
-    });
-
-    imp_->ri.setSetJointsFunc(k_aris_id, [this](const double* q) {
-        auto& motors = controller()->motorPool();
-        for (int i = 0; i < k_joint_num; ++i)
-        {
-            motors[k_motor_base + i].setTargetPos(q[i]);
-        }
-    });
-
-    imp_->ri.setForwardKinematicsFunc(k_aris_id, [this](const double* q, double* pm) -> bool {
-        auto& arm = arm_model(*this);
-        auto& ee = ee_motion(*this);
-        arm.setInputPos(const_cast<double*>(q));
-        if (arm.forwardKinematics())
-        {
-            return false;
-        }
-        ee.updP();
-        ee.getMpm(pm);
-        return true;
-    });
-
-    imp_->ri.setInverseKinematicsFunc(k_aris_id, [this](const double* pm, double* q) -> bool {
-        auto& arm = arm_model(*this);
-        auto& ee = ee_motion(*this);
-        arm.setInputPos(imp_->output_joints);
-        ee.setMpm(const_cast<double*>(pm));
-        if (arm.inverseKinematics())
-        {
-            return false;
-        }
-        arm.getInputPos(q);
-        for (int i = 0; i < k_joint_num; ++i)
-        {
-            q[i] = wrap_near(imp_->output_joints[i], q[i]);
-        }
-        return true;
-    });
+    imp_->follower.setMaxVel(imp_->max_lin_vel_);
+    imp_->follower.setMaxAcc(imp_->max_lin_acc_);
+    imp_->follower.setMaxAngVel(imp_->max_ang_vel_);
+    imp_->follower.setMaxAngAcc(imp_->max_ang_acc_);
 }
 
 auto A10TeleopTcpDriver::executeRT() -> int
@@ -221,47 +212,69 @@ auto A10TeleopTcpDriver::executeRT() -> int
         return 0;
     }
 
+    auto& motors = controller()->motorPool();
+    auto& arm = arm_model(*this);
+    auto& ee = ee_motion(*this);
+
     if (count() == 1)
     {
-        imp_->max_lin_vel_ = doubleParam("vel");
-        imp_->max_lin_acc_ = doubleParam("acc");
-        imp_->max_ang_vel_ = doubleParam("jvel");
-        imp_->max_ang_acc_ = doubleParam("jacc");
-        if (doubleParam("pos_scale") > 1e-9)
-        {
-            imp_->pos_scale_ = doubleParam("pos_scale");
-        }
-        if (doubleParam("rot_scale") > 1e-9)
-        {
-            imp_->rot_scale_ = doubleParam("rot_scale");
-        }
+        if (doubleParam("vel") > 1e-9) imp_->max_lin_vel_ = doubleParam("vel");
+        if (doubleParam("acc") > 1e-9) imp_->max_lin_acc_ = doubleParam("acc");
+        if (doubleParam("jvel") > 1e-9) imp_->max_ang_vel_ = doubleParam("jvel");
+        if (doubleParam("jacc") > 1e-9) imp_->max_ang_acc_ = doubleParam("jacc");
+
         imp_->follower.setMaxVel(imp_->max_lin_vel_);
         imp_->follower.setMaxAcc(imp_->max_lin_acc_);
         imp_->follower.setMaxAngVel(imp_->max_ang_vel_);
         imp_->follower.setMaxAngAcc(imp_->max_ang_acc_);
-        imp_->max_joint_vel_ = doubleParam("qvel");
-        imp_->max_joint_acc_ = doubleParam("qacc");
-        imp_->setup_joint_followers();
     }
 
-    imp_->ri.getJoints(k_aris_id, imp_->current_joints);
+    for (int i = 0; i < k_joint_num; ++i)
+    {
+        imp_->current_joints[i] = motors[k_motor_base + i].actualPos();
+    }
 
     double T_base_to_ee[16]{};
-    if (!imp_->ri.forwardKinematics(k_aris_id, imp_->current_joints, T_base_to_ee))
+    arm.setInputPos(imp_->current_joints);
+    if (arm.forwardKinematics())
     {
         return count();
     }
+    ee.updP();
+    ee.getMpm(T_base_to_ee);
 
     if (!imp_->inited_)
     {
+        // 诊断 1: 当前关节 FK 后立刻 IK 的闭环自检（用于排查模型/映射问题）。
+        {
+            double q_check[k_joint_num]{};
+            arm.setInputPos(imp_->current_joints);
+            ee.setMpm(T_base_to_ee);
+            if (!arm.inverseKinematics())
+            {
+                arm.getInputPos(q_check);
+                double dq_max = 0.0;
+                for (int i = 0; i < k_joint_num; ++i)
+                {
+                    dq_max = std::max(dq_max, std::abs(wrap_near(imp_->current_joints[i], q_check[i]) - imp_->current_joints[i]));
+                }
+                mout() << "vr diag: FK->IK self-check ok, max|dq|=" << dq_max << std::endl;
+            }
+            else
+            {
+                mout() << "vr diag: FK->IK self-check FAILED" << std::endl;
+            }
+        }
+
         std::memcpy(imp_->target_pm, T_base_to_ee, sizeof(imp_->target_pm));
         std::memcpy(imp_->next_T_base_to_ee, T_base_to_ee, sizeof(imp_->next_T_base_to_ee));
+        imp_->follower.reset();
         imp_->follower.setTargetPm(imp_->target_pm);
         imp_->follower.setTargetVa(k_zero_va);
         imp_->follower.setFollowPm(imp_->next_T_base_to_ee);
         imp_->follower.setFollowVa(k_zero_va);
-        imp_->follower.reset();
-        imp_->init_joint_followers_from_current();
+        std::memcpy(imp_->output_joints, imp_->current_joints, sizeof(imp_->output_joints));
+        std::memcpy(imp_->ik_joints, imp_->current_joints, sizeof(imp_->ik_joints));
         imp_->inited_ = true;
         mout() << "vr: init ok" << std::endl;
         return 1;
@@ -272,23 +285,65 @@ auto A10TeleopTcpDriver::executeRT() -> int
     if (g_tcp_server->fetch_ee_delta_if_updated(delta, seq, imp_->consumed_ee_delta_seq_))
     {
         imp_->consumed_ee_delta_seq_ = seq;
-        apply_vr_delta_to_pm(imp_->target_pm, delta, imp_->pos_scale_, imp_->rot_scale_);
+        if (is_effective_delta(delta))
+        {
+            imp_->no_effective_delta_ticks_ = 0;
+            apply_vr_delta_from_target(imp_->target_pm, delta);
+            imp_->follower.setTargetPm(imp_->target_pm);
+            imp_->follower.setTargetVa(k_zero_va);
+        }
+        else
+        {
+            ++imp_->no_effective_delta_ticks_;
+        }
+    }
+    else
+    {
+        ++imp_->no_effective_delta_ticks_;
+    }
+
+    // 长时间零输入时直接“抱住当前位置”，避免 IK 在静止附近抖动。
+    if (imp_->no_effective_delta_ticks_ > 50)
+    {
+        std::memcpy(imp_->target_pm, T_base_to_ee, sizeof(imp_->target_pm));
+        std::memcpy(imp_->next_T_base_to_ee, T_base_to_ee, sizeof(imp_->next_T_base_to_ee));
+        imp_->follower.setFollowPm(imp_->next_T_base_to_ee);
+        imp_->follower.setFollowVa(k_zero_va);
         imp_->follower.setTargetPm(imp_->target_pm);
         imp_->follower.setTargetVa(k_zero_va);
     }
 
     imp_->follower.moveDtAndGetResult(imp_->next_T_base_to_ee, imp_->next_vel, imp_->next_acc);
 
-    if (imp_->ri.inverseKinematics(k_aris_id, imp_->next_T_base_to_ee, imp_->ik_joints))
+    if (count() % 250 == 0)
     {
-        imp_->set_joint_targets_from_ik();
+        double pos_err = 0.0;
+        double rot_err = 0.0;
+        pm_pose_error(imp_->target_pm, T_base_to_ee, pos_err, rot_err);
+        mout() << "vr diag: target-current pos_err=" << pos_err << "m rot_err=" << rot_err << "rad"
+               << " idle_ticks=" << imp_->no_effective_delta_ticks_ << std::endl;
+    }
+
+    arm.setInputPos(imp_->output_joints);
+    ee.setMpm(imp_->next_T_base_to_ee);
+    if (!arm.inverseKinematics())
+    {
+        arm.getInputPos(imp_->ik_joints);
+        for (int i = 0; i < k_joint_num; ++i)
+        {
+            imp_->ik_joints[i] = wrap_near(imp_->output_joints[i], imp_->ik_joints[i]);
+        }
+        std::memcpy(imp_->output_joints, imp_->ik_joints, sizeof(imp_->output_joints));
     }
     else if (count() % 250 == 0)
     {
-        mout() << "vr: IK fail" << std::endl;
+        double pos_err = 0.0;
+        double rot_err = 0.0;
+        pm_pose_error(imp_->next_T_base_to_ee, T_base_to_ee, pos_err, rot_err);
+        mout() << "vr: IK fail, follow-current pos_err=" << pos_err << "m rot_err=" << rot_err << "rad" << std::endl;
     }
 
-    imp_->track_joints_and_apply();
+    imp_->apply_joints_to_motors(*this);
     return count();
 }
 
@@ -300,13 +355,9 @@ A10TeleopTcpDriver::A10TeleopTcpDriver(const std::string& name) : imp_(new Imp)
         "<Command name=\"vr\">"
         "  <GroupParam name=\"group_param\">"
         "    <Param name=\"vel\" abbreviation=\"v\" default=\"0.03\"/>"
-        "    <Param name=\"acc\" abbreviation=\"a\" default=\"3.0\"/>"
-        "    <Param name=\"jvel\" abbreviation=\"w\" default=\"1.0\"/>"
-        "    <Param name=\"jacc\" abbreviation=\"b\" default=\"5.0\"/>"
-        "    <Param name=\"qvel\" default=\"0.35\"/>"
-        "    <Param name=\"qacc\" default=\"2.0\"/>"
-        "    <Param name=\"pos_scale\" abbreviation=\"s\" default=\"1.0\"/>"
-        "    <Param name=\"rot_scale\" abbreviation=\"r\" default=\"1.0\"/>"
+        "    <Param name=\"acc\" abbreviation=\"a\" default=\"0.5\"/>"
+        "    <Param name=\"jvel\" abbreviation=\"w\" default=\"0.4\"/>"
+        "    <Param name=\"jacc\" abbreviation=\"b\" default=\"1.0\"/>"
         "  </GroupParam>"
         "</Command>");
 }
