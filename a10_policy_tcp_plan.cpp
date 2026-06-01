@@ -506,10 +506,8 @@ auto A10PolicyTcpCliStop::prepareNrt() -> void
     {
         m = aris::plan::Plan::CHECK_NONE | aris::plan::Plan::NOT_CHECK_POS_CONTINUOUS_SECOND_ORDER;
     }
-}
 
-auto A10PolicyTcpCliStop::executeRT() -> int
-{
+    // vr/policy 持续占用 RT 时 executeRT 不会立刻执行；在 prepareNrt 置位，运行中的驱动下一拍即可退出。
     g_a10_policy_tcp_stop_requested.store(true, std::memory_order_release);
     request_vr_teleop_stop();
     if (g_tcp_server != nullptr)
@@ -517,6 +515,11 @@ auto A10PolicyTcpCliStop::executeRT() -> int
         g_tcp_server->clear_policy_tcp_targets_nrt();
     }
     mout() << "stop: 已请求结束 policy/vr 驱动并清空 TCP 缓冲" << std::endl;
+    option() |= NOT_RUN_EXECUTE_FUNCTION;
+}
+
+auto A10PolicyTcpCliStop::executeRT() -> int
+{
     return 0;
 }
 
