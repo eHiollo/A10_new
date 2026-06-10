@@ -10,7 +10,7 @@
 #include <vector>
 
 #include "a10_tcp_server.hpp"
-#include "a10_teleop_tcp_plan.hpp"
+#include "a10_vr_plan.hpp"
 
 extern A10TcpServer* g_tcp_server;
 

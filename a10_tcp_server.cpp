@@ -442,7 +442,7 @@ void A10TcpServer::process_line(int client_sock, const std::string &line)
         return;
     }
 
-    // LeRobot 遥操作：基座系末端增量，actions 为一维 7 向量（m + deg + grip）。
+    // LeRobot 遥操作：tool/ee 系末端增量，actions 为一维 7 向量（m + rotvec rad + grip）。
     if (line.find("SET_EE_DELTA") != std::string::npos)
     {
         const size_t j0 = line.find('{');

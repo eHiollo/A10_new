@@ -13,6 +13,7 @@
 #include "kaanhbot/system/about.hpp"
 #include "kaanhbot/utility/tool_api.hpp"
 #include "plan.hpp"
+#include "a10_gripper_bridge.hpp"
 #include "a10_tcp_server.hpp"
 #include "gripper.hpp"
 
@@ -71,18 +72,17 @@ int main(int argc, char *argv[]){
         std::cerr <<"Faild to start tcp server " << std::endl;
     }
     
-    //创建舵机实例
-    /* BusServo gripper("/dev/ttyUSB0", 1000000, 150, true);
-    
-    if (gripper.ping(10) == 0) {
-        gripper.set_gripper_openclose(10,"100mm",1,800);
-        // sleep(5000);
-        std::cout <<"---------Gripper Connected----------" << std::endl;
+    static BusServo gripper("/dev/ttyUSB0", 1000000, 150, false);
+    if (gripper.ping(10) == 0)
+    {
+        std::cout << "---------Gripper Connected----------" << std::endl;
         g_gripper = &gripper;
-    } else {
-        std::cerr <<"Faild to start gripper " << std::endl;
-    } */
-    
+        std::thread([&]() { a10_tcp::run_gripper_service_loop(g_gripper); }).detach();
+    }
+    else
+    {
+        std::cerr << "Faild to start gripper " << std::endl;
+    }
 
     // 独立线程：仅把**当前关节反馈**写入 TCP 侧 robot_q_，供外部 GET_FOLLOWER_STATE / GET_LEADER_STATE 查询。
     // 与 TCP 下发的 target_q_（策略目标）是不同缓冲，不会互相覆盖；从臂驱动在实时 Plan ``policy_tcp``（A10PolicyTcpDriver）中执行。
@@ -97,9 +97,7 @@ int main(int argc, char *argv[]){
             {
                 current_q[i] = cs.controller().motorPool()[i].actualPos();
             }
-            // 获取舵机数据并存在第13维，也就是current_q[12]
-            // current_q[12] = g_gripper->get_position_mm(10,"100mm");
-            current_q[12] = 0;
+            current_q[12] = a10_tcp::g_vr_grip_actual_mm.load(std::memory_order_acquire);
 
             // chunk 执行期间不刷新 ``robot_q_``，客户端应轮询 ``GET_POLICY_STATUS`` 至 idle 后再 ``GET_FOLLOWER_STATE`` 做观测/推理。
             if (g_tcp_server != nullptr && !g_tcp_server->policy_batch_queue_empty())

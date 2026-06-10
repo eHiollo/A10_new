@@ -2,6 +2,9 @@
 
 project(kaanhbin VERSION 2.5.7 DESCRIPTION "")
 
+# 生成 compile_commands.json，供 clangd / C++ 扩展实现跳转、补全
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 configure_file(${PROJECT_SOURCE_DIR}/config/kaanhbin_version.h.in kaanhbin_version.h)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -38,7 +41,8 @@ set(KAANHBIN_SOURCES
     robot.cpp
     a10_tcp_server.cpp
     a10_policy_tcp_plan.cpp
-    a10_teleop_tcp_plan.cpp
+    a10_vr_plan.cpp
+    a10_gripper_bridge.cpp
     cmd_ft_unit_test.cpp
     gripper.cpp
     gravcomp.cpp

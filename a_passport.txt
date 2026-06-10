@@ -1,5 +1,4 @@
-login --user=Manufacturer --pwd=df4fe8a8bcd5c95cdb640aa9793bb32b
-
+login --user=Manufacturer --pwd=a48564053b3c7b54800246348c7fa4a0
 机械臂CLI指令
     #回到初始姿态
         m_init -p=0/1/2/3/4
