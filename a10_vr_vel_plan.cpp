@@ -23,8 +23,11 @@ namespace
 constexpr int k_joint_num = 6;
 constexpr int k_motor_base = 0;
 constexpr double k_dt = 0.002;
-constexpr double k_idle_trans_eps = 0.001;
-constexpr double k_idle_rot_eps = 0.002;
+constexpr double k_deg2rad = rtb::math::DEG2RAD;
+constexpr double k_trans_dz = 0.001;
+constexpr double k_rot_dz_rad = 0.2 * k_deg2rad;
+constexpr double k_max_trans_step = 0.03;
+constexpr double k_max_rot_step_rad = 1.8 * k_deg2rad;
 
 auto arm_model(aris::plan::Plan& p) -> aris::dynamic::Model&
 {
@@ -69,13 +72,6 @@ void clamp_vec3(double* v, double max_norm)
     }
 }
 
-void apply_vel_deadzone(double* v, double dz)
-{
-    if (std::abs(v[0]) < dz) v[0] = 0.0;
-    if (std::abs(v[1]) < dz) v[1] = 0.0;
-    if (std::abs(v[2]) < dz) v[2] = 0.0;
-}
-
 void slew_vec3(double* v, const double* v_target, double max_dv)
 {
     for (int i = 0; i < 3; ++i)
@@ -83,13 +79,6 @@ void slew_vec3(double* v, const double* v_target, double max_dv)
         const double dv = std::clamp(v_target[i] - v[i], -max_dv, max_dv);
         v[i] += dv;
     }
-}
-
-void decay_vec3(double* v, double factor)
-{
-    v[0] *= factor;
-    v[1] *= factor;
-    v[2] *= factor;
 }
 
 void pm_to_rot3(const double* pm, double* R)
@@ -168,60 +157,30 @@ void rotvec_to_rm(const double* w, double* R_out)
 }
 
 void pose_error_tool(
-    const double* pm_cmd,
+    const double* pm_tgt,
     const double* pm_act,
     double e_pos_tool[3],
     double e_rot_tool[3])
 {
     double e_pos_base[3] = {
-        pm_cmd[3] - pm_act[3],
-        pm_cmd[7] - pm_act[7],
-        pm_cmd[11] - pm_act[11],
+        pm_tgt[3] - pm_act[3],
+        pm_tgt[7] - pm_act[7],
+        pm_tgt[11] - pm_act[11],
     };
-    aris::dynamic::s_inv_pm_dot_v3(const_cast<double*>(pm_cmd), e_pos_base, e_pos_tool);
+    aris::dynamic::s_inv_pm_dot_v3(const_cast<double*>(pm_tgt), e_pos_base, e_pos_tool);
 
-    double R_cmd[9]{};
+    double R_tgt[9]{};
     double R_act[9]{};
     double R_act_T[9]{};
     double R_err[9]{};
-    pm_to_rot3(pm_cmd, R_cmd);
+    pm_to_rot3(pm_tgt, R_tgt);
     pm_to_rot3(pm_act, R_act);
     mat3_transpose(R_act, R_act_T);
-    mat3_mul(R_cmd, R_act_T, R_err);
+    mat3_mul(R_tgt, R_act_T, R_err);
 
     double w_err_base[3]{};
     rotmat_to_rotvec(R_err, w_err_base);
-    aris::dynamic::s_inv_pm_dot_v3(const_cast<double*>(pm_cmd), w_err_base, e_rot_tool);
-}
-
-void delta_to_tool_twist_target(
-    const std::vector<double>& delta,
-    double dt_tcp,
-    double rot_gain,
-    double vel_dz,
-    double v_target[3],
-    double w_target[3])
-{
-    v_target[0] = 0.0;
-    v_target[1] = 0.0;
-    v_target[2] = 0.0;
-    w_target[0] = 0.0;
-    w_target[1] = 0.0;
-    w_target[2] = 0.0;
-    if (dt_tcp <= rtb::math::EPSILON || delta.size() < 6)
-    {
-        return;
-    }
-    for (int i = 0; i < 3; ++i)
-    {
-        v_target[i] = delta[static_cast<std::size_t>(i)] / dt_tcp;
-    }
-    for (int i = 0; i < 3; ++i)
-    {
-        w_target[i] = delta[static_cast<std::size_t>(i + 3)] / dt_tcp * rot_gain;
-    }
-    apply_vel_deadzone(v_target, vel_dz);
-    apply_vel_deadzone(w_target, vel_dz * rot_gain);
+    aris::dynamic::s_inv_pm_dot_v3(const_cast<double*>(pm_tgt), w_err_base, e_rot_tool);
 }
 
 void integrate_tool_twist(double* pm, const double v_tool[3], const double w_tool[3], double dt)
@@ -240,37 +199,125 @@ void integrate_tool_twist(double* pm, const double v_tool[3], const double w_too
     std::memcpy(pm, pm_new, sizeof(pm_new));
 }
 
-bool is_effective_motion_delta(const std::vector<double>& delta)
+void filter_trans_delta(double* d)
+{
+    for (int i = 0; i < 3; ++i)
+    {
+        if (std::abs(d[i]) < k_trans_dz)
+        {
+            d[i] = 0.0;
+        }
+        if (d[i] > k_max_trans_step)
+        {
+            d[i] = k_max_trans_step;
+        }
+        if (d[i] < -k_max_trans_step)
+        {
+            d[i] = -k_max_trans_step;
+        }
+    }
+}
+
+void filter_rotvec_delta(double* w, double rot_gain)
+{
+    w[0] *= rot_gain;
+    w[1] *= rot_gain;
+    w[2] *= rot_gain;
+
+    const double theta = vec3_norm(w);
+    if (theta < k_rot_dz_rad)
+    {
+        w[0] = 0.0;
+        w[1] = 0.0;
+        w[2] = 0.0;
+        return;
+    }
+    if (theta > k_max_rot_step_rad)
+    {
+        const double s = k_max_rot_step_rad / theta;
+        w[0] *= s;
+        w[1] *= s;
+        w[2] *= s;
+    }
+}
+
+void apply_vr_delta_to_target(double* target_pm, const std::vector<double>& delta, double rot_gain)
+{
+    double d_tool[3]{};
+    double w_tool[3]{};
+    for (int i = 0; i < 3 && i < static_cast<int>(delta.size()); ++i)
+    {
+        d_tool[i] = delta[static_cast<std::size_t>(i)];
+    }
+    for (int i = 3; i < 6 && i < static_cast<int>(delta.size()); ++i)
+    {
+        w_tool[i - 3] = delta[static_cast<std::size_t>(i)];
+    }
+    filter_trans_delta(d_tool);
+    filter_rotvec_delta(w_tool, rot_gain);
+
+    double R_delta[9]{};
+    rotvec_to_rm(w_tool, R_delta);
+
+    double delta_pm[16]{};
+    rtb::math::compose_transform(R_delta, d_tool, delta_pm);
+
+    double target_new[16]{};
+    aris::dynamic::s_pm_dot_pm(target_pm, delta_pm, target_new);
+    std::memcpy(target_pm, target_new, sizeof(target_new));
+}
+
+bool is_effective_motion_delta(const std::vector<double>& delta, double rot_gain)
 {
     if (delta.size() < 6)
     {
         return false;
     }
+    const double k_rot_eps_rad = k_rot_dz_rad / std::max(rot_gain, 1e-9);
     for (int i = 0; i < 3; ++i)
     {
-        if (std::abs(delta[static_cast<std::size_t>(i)]) >= k_idle_trans_eps)
+        if (std::abs(delta[static_cast<std::size_t>(i)]) >= k_trans_dz)
         {
             return true;
         }
     }
-    const double w[3] = {
-        delta[3],
-        delta[4],
-        delta[5],
+    const double w[3] = {delta[3], delta[4], delta[5]};
+    return vec3_norm(w) >= k_rot_eps_rad;
+}
+
+void pull_target_toward_actual(double* target_pm, const double* actual_pm, double alpha)
+{
+    if (alpha <= rtb::math::EPSILON)
+    {
+        return;
+    }
+    double e_pos_tool[3]{};
+    double e_rot_tool[3]{};
+    pose_error_tool(target_pm, actual_pm, e_pos_tool, e_rot_tool);
+
+    const double inv_dt = 1.0 / k_dt;
+    const double v_pull[3] = {
+        -e_pos_tool[0] * alpha * inv_dt,
+        -e_pos_tool[1] * alpha * inv_dt,
+        -e_pos_tool[2] * alpha * inv_dt,
     };
-    return vec3_norm(w) >= k_idle_rot_eps;
+    const double w_pull[3] = {
+        -e_rot_tool[0] * alpha * inv_dt,
+        -e_rot_tool[1] * alpha * inv_dt,
+        -e_rot_tool[2] * alpha * inv_dt,
+    };
+    integrate_tool_twist(target_pm, v_pull, w_pull, k_dt);
 }
 
 }  // namespace
 
 struct A10VrVelDriver::Imp
 {
+    double target_pm[16]{};
     double command_pm[16]{};
 
-    double v_ff_target[3]{};
-    double w_ff_target[3]{};
-    double v_ff_tool[3]{};
-    double w_ff_tool[3]{};
+    double v_cmd_tool[3]{};
+    double w_cmd_tool[3]{};
 
     double current_joints[k_joint_num]{};
     double ik_joints[k_joint_num]{};
@@ -281,19 +328,15 @@ struct A10VrVelDriver::Imp
     bool inited_{false};
     bool idle_coast_{false};
 
-    double tcp_hz_{30.0};
     double max_lin_vel_{0.12};
-    double max_ang_vel_{0.25};
+    double max_ang_vel_{0.4};
     double max_lin_acc_{0.8};
-    double max_ang_acc_{2.0};
-    double target_decay_{0.992};
-    double kp_pos_{0.0};
-    double kp_rot_{0.0};
-    double v_fb_max_{0.03};
-    double w_fb_max_{0.10};
+    double max_ang_acc_{1.5};
+    double target_pull_{0.995};
+    double kp_pos_{3.0};
+    double kp_rot_{2.0};
     double rot_gain_{1.0};
     double timeout_s_{0.12};
-    double vel_dz_{0.001};
 
     void apply_joints_to_motors(aris::plan::Plan& plan)
     {
@@ -304,26 +347,14 @@ struct A10VrVelDriver::Imp
         }
     }
 
-    void zero_feedforward()
+    void zero_motion_state()
     {
-        v_ff_target[0] = 0.0;
-        v_ff_target[1] = 0.0;
-        v_ff_target[2] = 0.0;
-        w_ff_target[0] = 0.0;
-        w_ff_target[1] = 0.0;
-        w_ff_target[2] = 0.0;
-        v_ff_tool[0] = 0.0;
-        v_ff_tool[1] = 0.0;
-        v_ff_tool[2] = 0.0;
-        w_ff_tool[0] = 0.0;
-        w_ff_tool[1] = 0.0;
-        w_ff_tool[2] = 0.0;
-    }
-
-    void coast_feedforward_targets()
-    {
-        decay_vec3(v_ff_target, target_decay_);
-        decay_vec3(w_ff_target, target_decay_);
+        v_cmd_tool[0] = 0.0;
+        v_cmd_tool[1] = 0.0;
+        v_cmd_tool[2] = 0.0;
+        w_cmd_tool[0] = 0.0;
+        w_cmd_tool[1] = 0.0;
+        w_cmd_tool[2] = 0.0;
     }
 };
 
@@ -333,7 +364,7 @@ auto A10VrVelDriver::prepareNrt() -> void
     imp_->idle_coast_ = false;
     imp_->consumed_ee_delta_seq_ = 0;
     imp_->last_packet_count_ = 0;
-    imp_->zero_feedforward();
+    imp_->zero_motion_state();
     g_a10_vr_stop_requested.store(false, std::memory_order_release);
 
     for (auto& m : motorOptions())
@@ -349,7 +380,7 @@ auto A10VrVelDriver::executeRT() -> int
     {
         g_a10_vr_stop_requested.store(false, std::memory_order_release);
         imp_->inited_ = false;
-        imp_->zero_feedforward();
+        imp_->zero_motion_state();
         clear_vr_grip_cmd();
         mout() << "vr_vel: stop by policy stop flag" << std::endl;
         return 0;
@@ -359,7 +390,7 @@ auto A10VrVelDriver::executeRT() -> int
     {
         g_a10_vr_stop_requested.store(false, std::memory_order_release);
         imp_->inited_ = false;
-        imp_->zero_feedforward();
+        imp_->zero_motion_state();
         clear_vr_grip_cmd();
         mout() << "vr_vel: stop by teleop stop flag" << std::endl;
         return 0;
@@ -376,22 +407,18 @@ auto A10VrVelDriver::executeRT() -> int
 
     if (count() == 1)
     {
-        if (doubleParam("tcp_hz") > 1e-3) imp_->tcp_hz_ = doubleParam("tcp_hz");
         if (doubleParam("vmax") > 1e-9) imp_->max_lin_vel_ = doubleParam("vmax");
         if (doubleParam("wmax") > 1e-9) imp_->max_ang_vel_ = doubleParam("wmax");
         if (doubleParam("amax") > 1e-9) imp_->max_lin_acc_ = doubleParam("amax");
         if (doubleParam("jacc") > 1e-9) imp_->max_ang_acc_ = doubleParam("jacc");
-        if (doubleParam("decay") > 0.0 && doubleParam("decay") < 1.0)
+        if (doubleParam("pull") > 0.0 && doubleParam("pull") < 1.0)
         {
-            imp_->target_decay_ = doubleParam("decay");
+            imp_->target_pull_ = doubleParam("pull");
         }
         if (doubleParam("kp") >= 0.0) imp_->kp_pos_ = doubleParam("kp");
         if (doubleParam("kp_rot") >= 0.0) imp_->kp_rot_ = doubleParam("kp_rot");
-        if (doubleParam("v_fb_max") > 1e-9) imp_->v_fb_max_ = doubleParam("v_fb_max");
-        if (doubleParam("w_fb_max") > 1e-9) imp_->w_fb_max_ = doubleParam("w_fb_max");
         if (doubleParam("rot_gain") > 1e-9) imp_->rot_gain_ = doubleParam("rot_gain");
         if (doubleParam("timeout") > 1e-9) imp_->timeout_s_ = doubleParam("timeout");
-        if (doubleParam("vel_dz") > 0.0) imp_->vel_dz_ = doubleParam("vel_dz");
         if (doubleParam("grip_vel") > 1e-9)
         {
             g_vr_grip_vel_mm_s.store(doubleParam("grip_vel"), std::memory_order_release);
@@ -414,18 +441,18 @@ auto A10VrVelDriver::executeRT() -> int
 
     if (!imp_->inited_)
     {
+        std::memcpy(imp_->target_pm, T_base_to_ee, sizeof(imp_->target_pm));
         std::memcpy(imp_->command_pm, T_base_to_ee, sizeof(imp_->command_pm));
         std::memcpy(imp_->output_joints, imp_->current_joints, sizeof(imp_->output_joints));
         std::memcpy(imp_->ik_joints, imp_->current_joints, sizeof(imp_->ik_joints));
-        imp_->zero_feedforward();
+        imp_->zero_motion_state();
         imp_->last_packet_count_ = count();
         sync_vr_grip_target_from_actual(g_vr_grip_actual_mm.load(std::memory_order_acquire));
         imp_->inited_ = true;
-        mout() << "vr_vel: init ok (slew-smoothed feedforward, tool-frame)" << std::endl;
+        mout() << "vr_vel: init ok (P velocity, target+=delta, tool-frame)" << std::endl;
         return 1;
     }
 
-    const double dt_tcp = 1.0 / imp_->tcp_hz_;
     const double elapsed_since_packet =
         static_cast<double>(count() - imp_->last_packet_count_) * k_dt;
 
@@ -439,13 +466,10 @@ auto A10VrVelDriver::executeRT() -> int
         {
             set_vr_grip_cmd(delta[6]);
         }
-        if (is_effective_motion_delta(delta))
+        if (is_effective_motion_delta(delta, imp_->rot_gain_))
         {
             imp_->idle_coast_ = false;
-            delta_to_tool_twist_target(
-                delta, dt_tcp, imp_->rot_gain_, imp_->vel_dz_, imp_->v_ff_target, imp_->w_ff_target);
-            clamp_vec3(imp_->v_ff_target, imp_->max_lin_vel_);
-            clamp_vec3(imp_->w_ff_target, imp_->max_ang_vel_);
+            apply_vr_delta_to_target(imp_->target_pm, delta, imp_->rot_gain_);
         }
         else
         {
@@ -459,49 +483,37 @@ auto A10VrVelDriver::executeRT() -> int
 
     if (imp_->idle_coast_)
     {
-        imp_->coast_feedforward_targets();
+        const double alpha = 1.0 - imp_->target_pull_;
+        pull_target_toward_actual(imp_->target_pm, T_base_to_ee, alpha);
     }
-
-    slew_vec3(imp_->v_ff_tool, imp_->v_ff_target, imp_->max_lin_acc_ * k_dt);
-    slew_vec3(imp_->w_ff_tool, imp_->w_ff_target, imp_->max_ang_acc_ * k_dt);
 
     double e_pos_tool[3]{};
     double e_rot_tool[3]{};
-    pose_error_tool(imp_->command_pm, T_base_to_ee, e_pos_tool, e_rot_tool);
+    pose_error_tool(imp_->target_pm, T_base_to_ee, e_pos_tool, e_rot_tool);
 
-    double v_fb_tool[3] = {
+    double v_target_tool[3] = {
         imp_->kp_pos_ * e_pos_tool[0],
         imp_->kp_pos_ * e_pos_tool[1],
         imp_->kp_pos_ * e_pos_tool[2],
     };
-    double w_fb_tool[3] = {
+    double w_target_tool[3] = {
         imp_->kp_rot_ * e_rot_tool[0],
         imp_->kp_rot_ * e_rot_tool[1],
         imp_->kp_rot_ * e_rot_tool[2],
     };
-    clamp_vec3(v_fb_tool, imp_->v_fb_max_);
-    clamp_vec3(w_fb_tool, imp_->w_fb_max_);
+    clamp_vec3(v_target_tool, imp_->max_lin_vel_);
+    clamp_vec3(w_target_tool, imp_->max_ang_vel_);
 
-    double v_cmd_tool[3] = {
-        imp_->v_ff_tool[0] + v_fb_tool[0],
-        imp_->v_ff_tool[1] + v_fb_tool[1],
-        imp_->v_ff_tool[2] + v_fb_tool[2],
-    };
-    double w_cmd_tool[3] = {
-        imp_->w_ff_tool[0] + w_fb_tool[0],
-        imp_->w_ff_tool[1] + w_fb_tool[1],
-        imp_->w_ff_tool[2] + w_fb_tool[2],
-    };
-    clamp_vec3(v_cmd_tool, imp_->max_lin_vel_);
-    clamp_vec3(w_cmd_tool, imp_->max_ang_vel_);
+    slew_vec3(imp_->v_cmd_tool, v_target_tool, imp_->max_lin_acc_ * k_dt);
+    slew_vec3(imp_->w_cmd_tool, w_target_tool, imp_->max_ang_acc_ * k_dt);
 
-    integrate_tool_twist(imp_->command_pm, v_cmd_tool, w_cmd_tool, k_dt);
+    integrate_tool_twist(imp_->command_pm, imp_->v_cmd_tool, imp_->w_cmd_tool, k_dt);
 
     if (count() % 250 == 0)
     {
         mout() << "vr_vel diag: |e_pos|=" << vec3_norm(e_pos_tool) << "m |e_rot|=" << vec3_norm(e_rot_tool)
-               << "rad |v_tgt|=" << vec3_norm(imp_->v_ff_target) << " |v_ff|=" << vec3_norm(imp_->v_ff_tool)
-               << " |v_fb|=" << vec3_norm(v_fb_tool) << std::endl;
+               << "rad |v|=" << vec3_norm(imp_->v_cmd_tool) << " |w|=" << vec3_norm(imp_->w_cmd_tool)
+               << (imp_->idle_coast_ ? " idle" : "") << std::endl;
     }
 
     arm.setInputPos(imp_->output_joints);
@@ -532,19 +544,15 @@ A10VrVelDriver::A10VrVelDriver(const std::string& name) : imp_(new Imp)
         command(),
         "<Command name=\"vr_vel\">"
         "  <GroupParam name=\"group_param\">"
-        "    <Param name=\"tcp_hz\" abbreviation=\"f\" default=\"30\"/>"
+        "    <Param name=\"kp\" abbreviation=\"p\" default=\"3.0\"/>"
+        "    <Param name=\"kp_rot\" abbreviation=\"r\" default=\"2.0\"/>"
         "    <Param name=\"vmax\" abbreviation=\"v\" default=\"0.12\"/>"
-        "    <Param name=\"wmax\" abbreviation=\"w\" default=\"0.25\"/>"
+        "    <Param name=\"wmax\" abbreviation=\"w\" default=\"0.4\"/>"
         "    <Param name=\"amax\" abbreviation=\"a\" default=\"0.8\"/>"
-        "    <Param name=\"jacc\" abbreviation=\"j\" default=\"2.0\"/>"
-        "    <Param name=\"decay\" abbreviation=\"c\" default=\"0.992\"/>"
-        "    <Param name=\"kp\" abbreviation=\"p\" default=\"0\"/>"
-        "    <Param name=\"kp_rot\" abbreviation=\"r\" default=\"0\"/>"
-        "    <Param name=\"v_fb_max\" abbreviation=\"x\" default=\"0.03\"/>"
-        "    <Param name=\"w_fb_max\" abbreviation=\"y\" default=\"0.10\"/>"
+        "    <Param name=\"jacc\" abbreviation=\"j\" default=\"1.5\"/>"
+        "    <Param name=\"pull\" abbreviation=\"l\" default=\"0.995\"/>"
         "    <Param name=\"rot_gain\" abbreviation=\"g\" default=\"1.0\"/>"
         "    <Param name=\"timeout\" abbreviation=\"t\" default=\"0.12\"/>"
-        "    <Param name=\"vel_dz\" abbreviation=\"d\" default=\"0.001\"/>"
         "    <Param name=\"grip_vel\" abbreviation=\"h\" default=\"50\"/>"
         "  </GroupParam>"
         "</Command>");

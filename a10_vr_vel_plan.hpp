@@ -8,8 +8,8 @@
 
 namespace a10_tcp
 {
-/// VR 速度遥操作：``SET_EE_DELTA`` → 目标 twist；500Hz 加速度限幅平滑前馈 → IK。
-/// 手柄 idle（零 delta）或断流后目标速度指数衰减滑行，非急停。
+/// VR P 速度遥操作：``SET_EE_DELTA`` 累加 ``target_pm``；``v = Kp×(target−actual)`` 限幅 + slew → IK。
+/// idle 时 ``target`` 缓慢贴回实测位姿。夹爪同 ``vr``。
 class A10VrVelDriver : public aris::core::CloneObject<A10VrVelDriver, aris::plan::Plan>
 {
 public:
