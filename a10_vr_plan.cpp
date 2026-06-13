@@ -37,8 +37,9 @@ constexpr double k_dt = 0.002;
 constexpr double k_deg2rad = rtb::math::DEG2RAD;
 constexpr double k_zero_va[6]{};
 
-constexpr double k_trans_dz = 0.002;
-constexpr double k_rot_dz_rad = 0.4 * k_deg2rad;
+// VR TCP 30Hz：单包 delta 约为 15Hz 的一半，死区同比缩小
+constexpr double k_trans_dz = 0.001;
+constexpr double k_rot_dz_rad = 0.2 * k_deg2rad;
 constexpr double k_rot_gain = 0.8;
 constexpr double k_max_trans_step = 0.03;
 constexpr double k_max_rot_step_rad = 1.8 * k_deg2rad;
