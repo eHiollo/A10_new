@@ -2,6 +2,7 @@
 
 #include "a10_policy_tcp_plan.hpp"
 #include "a10_vr_plan.hpp"
+#include "a10_vr_vel_plan.hpp"
 #include "cmd_ft_unit_test.hpp"
 #include "kaanhbot/utility/kaanh.hpp"
 #include "kaanhbot/io/io_plan.hpp"
@@ -92,6 +93,7 @@ auto creatPlanRoot()->std::unique_ptr<aris::plan::PlanRoot>
     plan_root->planPool().add<a10_tcp::A10PolicyTcpDriver>();
     plan_root->planPool().add<a10_tcp::A10PolicyTcpCliStop>();
     plan_root->planPool().add<a10_tcp::A10VrDriver>();
+    plan_root->planPool().add<a10_tcp::A10VrVelDriver>();
     plan_root->planPool().add<a10_tcp::A10VrCliStop>();
 
     return plan_root;

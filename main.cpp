@@ -19,6 +19,7 @@
 
 #include "robot.hpp"
 #include "assemcomd.hpp"
+#include <memory>
 #define __S(x) #x
 #define _S(x) __S(x)
 
@@ -72,17 +73,28 @@ int main(int argc, char *argv[]){
         std::cerr <<"Faild to start tcp server " << std::endl;
     }
     
-    static BusServo gripper("/dev/ttyUSB0", 1000000, 150, false);
-    if (gripper.ping(10) == 0)
+    static std::unique_ptr<BusServo> gripper_holder;
+    try
     {
-        std::cout << "---------Gripper Connected----------" << std::endl;
-        g_gripper = &gripper;
-        std::thread([&]() { a10_tcp::run_gripper_service_loop(g_gripper); }).detach();
+        gripper_holder = std::make_unique<BusServo>("/dev/ttyUSB0", 1000000, 150, false);
+        if (gripper_holder->ping(10) == 0)
+        {
+            g_gripper = gripper_holder.get();
+            std::cout << "Gripper: connected (USB)" << std::endl;
+        }
+        else
+        {
+            gripper_holder.reset();
+            std::cout << "Gripper: not detected, arm-only mode" << std::endl;
+        }
     }
-    else
+    catch (const std::exception& e)
     {
-        std::cerr << "Faild to start gripper " << std::endl;
+        gripper_holder.reset();
+        g_gripper = nullptr;
+        std::cout << "Gripper: disabled (" << e.what() << "), arm-only mode" << std::endl;
     }
+    std::thread([]() { a10_tcp::run_gripper_service_loop(g_gripper); }).detach();
 
     // 独立线程：仅把**当前关节反馈**写入 TCP 侧 robot_q_，供外部 GET_FOLLOWER_STATE / GET_LEADER_STATE 查询。
     // 与 TCP 下发的 target_q_（策略目标）是不同缓冲，不会互相覆盖；从臂驱动在实时 Plan ``policy_tcp``（A10PolicyTcpDriver）中执行。
