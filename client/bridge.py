@@ -87,6 +87,19 @@ class BridgeConfig:
     # AsyncVLA：候选记录目录（None=不记录）；pilot 时开启以分析 divergence
     # 分布与维度构成（校准夹爪权重）。
     log_candidates_dir: str | None = None
+    # AsyncVLA adaptive N：开启后忽略 sample_n，按 divergence EMA 在
+    # {1,2,4,8} 档位间切换（离散档位 + 滞后降档，避免频繁触发服务端
+    # jit 重编译）。阈值单位与 verifier divergence 一致，pilot 后用
+    # analyze_candidates.py 的 p50/p90 校准。
+    adaptive_n: bool = False
+    div_low: float = 0.05
+    div_mid: float = 0.15
+    div_high: float = 0.30
+    # 降档滞后：目标档位连续低于当前档位该轮数后才真正降档。
+    downshift_patience: int = 5
+    # N=1 时无 divergence 信号（单次采样路径不算 verifier），
+    # 每隔该轮数用 4 候选探测一次分歧，防止"降档后遇复杂动作升不回来"。
+    probe_interval: int = 20
 
 
 class PiRobotBridge:
@@ -116,6 +129,11 @@ class PiRobotBridge:
         self._cand_logger: CandidateLogger | None = None
         if cfg.log_candidates_dir:
             self._cand_logger = CandidateLogger(cfg.log_candidates_dir)
+        # adaptive N 状态：中间档起步, EMA 未初始化。
+        self._current_n = 4
+        self._div_ema: float | None = None
+        self._below_count = 0
+        self._probe_count = 0
 
     def _build_observation(self, state_7d: np.ndarray) -> dict[str, Any]:
         right_rgb = self._right_cam.read_rgb()
@@ -134,18 +152,74 @@ class PiRobotBridge:
             "prompt": self._cfg.prompt,
         }
 
+    def _decide_sample_n(self) -> int:
+        """本轮采样数：固定模式返回 sample_n；adaptive 模式返回当前档位。
+
+        N=1 档位走单次采样路径（无 verifier 即无 divergence），按
+        probe_interval 周期插一轮 4 候选探测分歧，保证复杂动作能及时升档。
+        """
+        if not self._cfg.adaptive_n:
+            return self._cfg.sample_n
+        if self._current_n == 1:
+            self._probe_count += 1
+            if self._probe_count >= self._cfg.probe_interval:
+                self._probe_count = 0
+                return 4
+            return 1
+        self._probe_count = 0
+        return self._current_n
+
+    def _update_adaptive_n(self, divergence: float) -> None:
+        """divergence EMA → 目标档位 {1,2,4,8}；升档立即、降档滞后。
+
+        升档判定用 max(ema, 瞬时值)：复杂动作（分歧 spike）当轮即可升档，
+        不被 EMA 平滑拖慢；降档仍走 EMA + 滞后，防止噪声抖动与频繁
+        jit 重编译。
+        """
+        alpha = 0.3
+        self._div_ema = divergence if self._div_ema is None else (1 - alpha) * self._div_ema + alpha * divergence
+        ema = self._div_ema
+        cfg = self._cfg
+
+        def _level(signal: float) -> int:
+            if signal < cfg.div_low:
+                return 1
+            if signal < cfg.div_mid:
+                return 2
+            if signal < cfg.div_high:
+                return 4
+            return 8
+
+        up_target = _level(max(ema, divergence))
+        if up_target > self._current_n:
+            logger.info("adaptive-n: 升档 %d → %d (ema=%.4f, 瞬时=%.4f)", self._current_n, up_target, ema, divergence)
+            self._current_n = up_target
+            self._below_count = 0
+            return
+
+        target = _level(ema)
+        if target < self._current_n:
+            self._below_count += 1
+            if self._below_count >= cfg.downshift_patience:
+                logger.info("adaptive-n: 降档 %d → %d (ema=%.4f, 滞后%d轮)", self._current_n, target, ema, self._below_count)
+                self._current_n = target
+                self._below_count = 0
+        else:
+            self._below_count = 0
+
     def _infer_chunk(self, state_7d: np.ndarray) -> np.ndarray:
         """采集观测并推理，返回 ``(T, action_dim)`` action chunk。
 
-        sample_n > 1 时走 AsyncVLA 路径：服务端单次 batch 采样 N 个候选，
+        采样数 >1 时走 AsyncVLA 路径：服务端单次 batch 采样 N 个候选，
         本地 L1 verifier（几何一致性 medoid）选优并记录分歧度。
         """
         obs = self._build_observation(state_7d)
-        if self._cfg.sample_n <= 1:
+        n = self._decide_sample_n()
+        if n <= 1:
             result = self._ws.infer(obs)
             return _extract_action_chunk(result, expected_dim=self._cfg.action_dim)
 
-        result = self._ws.infer(obs, sample_n=self._cfg.sample_n)
+        result = self._ws.infer(obs, sample_n=n)
         candidates = _extract_action_candidates(result, expected_dim=self._cfg.action_dim)
         vr = self._verifier.select(candidates)
         self._infer_count += 1
@@ -154,6 +228,8 @@ class PiRobotBridge:
                 self._cand_logger.log(self._infer_count, candidates, vr.best_index, vr.divergence, vr.per_candidate_mean_dist)
             except Exception:  # noqa: BLE001
                 logger.exception("候选记录写入失败（不影响主流程）。")
+        if self._cfg.adaptive_n:
+            self._update_adaptive_n(vr.divergence)
         if self._infer_count % 20 == 0:
             logger.info(
                 "verifier: N=%d best=%d divergence=%.4f per_cand_mean=%s",
@@ -418,6 +494,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="AsyncVLA: 候选记录目录(jsonl, 含全量候选; pilot 分析用)。不传则不记录。",
     )
+    parser.add_argument(
+        "--adaptive-n",
+        action="store_true",
+        help="AsyncVLA: 按 divergence EMA 在 {1,2,4,8} 档位自适应采样数(忽略 --sample-n; 阈值 pilot 后校准)。",
+    )
+    parser.add_argument("--div-low", type=float, default=0.05, help="adaptive-n 阈值: 低于此 divergence EMA 降到 N=1。")
+    parser.add_argument("--div-mid", type=float, default=0.15, help="adaptive-n 阈值: N=2/N=4 分界。")
+    parser.add_argument("--div-high", type=float, default=0.30, help="adaptive-n 阈值: 高于此升到 N=8。")
+    parser.add_argument("--downshift-patience", type=int, default=5, help="adaptive-n 降档滞后轮数(防抖动+防频繁 jit 重编译)。")
+    parser.add_argument("--probe-interval", type=int, default=20, help="adaptive-n N=1 档位时每 N 轮插一轮 4 候选分歧探测。")
     return parser
 
 
@@ -471,6 +557,12 @@ def run_from_args(args: argparse.Namespace) -> None:
             sample_n=max(1, int(args.sample_n)),
             verifier_gripper_weight=float(args.verifier_gripper_weight),
             log_candidates_dir=args.log_candidates if args.log_candidates else None,
+            adaptive_n=bool(args.adaptive_n),
+            div_low=float(args.div_low),
+            div_mid=float(args.div_mid),
+            div_high=float(args.div_high),
+            downshift_patience=max(1, int(args.downshift_patience)),
+            probe_interval=max(1, int(args.probe_interval)),
         ),
     )
 
