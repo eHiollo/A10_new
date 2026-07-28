@@ -312,6 +312,8 @@ namespace robot
         for (auto& m : motorOptions()) m =
             aris::plan::Plan::NOT_CHECK_POS_CONTINUOUS_SECOND_ORDER;
 
+        imp_->init = false;
+
         GravComp gc;
 		gc.loadPLVector(imp_->arm1_p_vector, imp_->arm1_l_vector, imp_->arm2_p_vector, imp_->arm2_l_vector);
 		mout() << "Load P & L Vector" << std::endl;
@@ -375,31 +377,6 @@ namespace robot
             0, 0, 5 * PI / 6, -7 * PI / 12, -PI / 2, 0
         };
 
-        if (count() == 1) {
-            int p = int32Param("preset");
-            if (p < 0 || p > 5) {
-                mout() << "m_init: preset must be 0..5, got " << p << ", using 0" << std::endl;
-                p = 0;
-            }
-            imp_->preset_index = p;
-            mout() << "m_init: preset=" << imp_->preset_index << std::endl;
-        }
-
-        static const double *const k_init_preset_table[6] = {
-            k_init_preset_0, k_init_preset_1, k_init_preset_2, k_init_preset_3,
-            k_init_preset_4, k_init_preset_5};
-        const double *const init_pos = k_init_preset_table[imp_->preset_index];
-
-        //6-12维反向
-        // static double init_pos[12] =
-        // { 0, 0, 5 * PI / 6, -5 * PI / 6, -PI / 2, 0,
-        // 0, 0, -5 * PI / 6, 5 * PI / 6, PI / 2, 0 };
-
-        // //1-6维反向
-        // static double init_pos[12] =
-        // { 0, 0, -5 * PI / 6, 5 * PI / 6, PI / 2, 0,
-        // 0, 0, -2 * PI / 3, PI / 6, PI / 2, 0 };
-
         auto getForceData = [&](double* data_, int m_, bool init_)
 		{
 
@@ -446,12 +423,36 @@ namespace robot
 
 		};
 
+        static const double *const k_init_preset_table[6] = {
+            k_init_preset_0, k_init_preset_1, k_init_preset_2, k_init_preset_3,
+            k_init_preset_4, k_init_preset_5};
+
         if (count() == 1) {
+            int p = int32Param("preset");
+            if (p < 0 || p > 5) {
+                mout() << "m_init: preset must be 0..5, got " << p << ", using 0" << std::endl;
+                p = 0;
+            }
+            imp_->preset_index = p;
+            mout() << "m_init: preset=" << imp_->preset_index << std::endl;
+
             getForceData(imp_->arm1_init_force, 0, imp_->init);
             getForceData(imp_->arm2_init_force, 1, imp_->init);
-             master()->logFileRawName(std::string("/home/kaanh/Desktop/kaanhbin/force_comp_data/forceComp_" + aris::core::logFileTimeFormat(std::chrono::system_clock::now())).c_str());
+            master()->logFileRawName(std::string("/home/kaanh/Desktop/kaanhbin/force_comp_data/forceComp_" + aris::core::logFileTimeFormat(std::chrono::system_clock::now())).c_str());
             imp_->init = true;
         }
+
+        const double *const init_pos = k_init_preset_table[imp_->preset_index];
+
+        //6-12维反向
+        // static double init_pos[12] =
+        // { 0, 0, 5 * PI / 6, -5 * PI / 6, -PI / 2, 0,
+        // 0, 0, -5 * PI / 6, 5 * PI / 6, PI / 2, 0 };
+
+        // //1-6维反向
+        // static double init_pos[12] =
+        // { 0, 0, -5 * PI / 6, 5 * PI / 6, PI / 2, 0,
+        // 0, 0, -2 * PI / 3, PI / 6, PI / 2, 0 };
 
         double current_arm1_pm[16]{0};
         double current_arm1_force[6]{0};
