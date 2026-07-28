@@ -266,6 +266,7 @@ void A10TcpServer::clear_policy_tcp_targets_nrt()
         target_q_.clear();
     }
     clear_ee_delta_target_nrt();
+    clear_ee_target_nrt();
 }
 
 void A10TcpServer::clear_ee_delta_target_nrt()
@@ -297,6 +298,60 @@ bool A10TcpServer::fetch_ee_delta_if_updated(
         return false;
     }
     out = target_ee_delta_;
+    return true;
+}
+
+// ---------- 末端位姿反馈 (GET_EE_STATE) ----------
+
+void A10TcpServer::update_ee_pose(const double pe[6])
+{
+    std::lock_guard<std::mutex> lk(ee_pose_mutex_);
+    current_ee_pe_.assign(pe, pe + 6);
+    ee_pose_valid_ = true;
+}
+
+bool A10TcpServer::get_ee_pose(std::vector<double>& out)
+{
+    std::lock_guard<std::mutex> lk(ee_pose_mutex_);
+    if (!ee_pose_valid_ || current_ee_pe_.size() < 6)
+    {
+        return false;
+    }
+    out = current_ee_pe_;
+    return true;
+}
+
+// ---------- 绝对末端目标 (SET_EE_TARGET) ----------
+
+std::uint64_t A10TcpServer::ee_target_seq() const
+{
+    return ee_target_seq_.load(std::memory_order_acquire);
+}
+
+void A10TcpServer::clear_ee_target_nrt()
+{
+    {
+        std::lock_guard<std::mutex> lk(ee_target_mutex_);
+        target_ee_absolute_.clear();
+    }
+    ee_target_seq_.store(0, std::memory_order_release);
+}
+
+bool A10TcpServer::fetch_ee_target_if_updated(
+    std::vector<double>& out, std::uint64_t& out_seq, std::uint64_t consumed_seq)
+{
+    const std::uint64_t seq = ee_target_seq_.load(std::memory_order_acquire);
+    out_seq = seq;
+    if (seq == 0 || seq == consumed_seq)
+    {
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(ee_target_mutex_);
+    if (target_ee_absolute_.size() < 6)
+    {
+        return false;
+    }
+    out = target_ee_absolute_;
     return true;
 }
 
@@ -420,6 +475,27 @@ void A10TcpServer::send_follower_state(int client_sock)
     }
 }
 
+void A10TcpServer::send_ee_state(int client_sock)
+{
+    std::vector<double> pe;
+    const bool ok = get_ee_pose(pe);
+    if (!ok)
+    {
+        send_line_to_client(client_sock, std::string("{\"ee\":null}\n"));
+        return;
+    }
+
+    std::string payload = "{\"ee\": [";
+    for (std::size_t i = 0; i < pe.size() && i < 6; ++i)
+    {
+        if (i) payload += ", ";
+        payload += std::to_string(pe[i]);
+    }
+    payload += "]}\n";
+
+    send_line_to_client(client_sock, payload);
+}
+
 void A10TcpServer::process_line(int client_sock, const std::string &line)
 {
     // 响应“”GET_LEADER_STATE”请求
@@ -433,6 +509,13 @@ void A10TcpServer::process_line(int client_sock, const std::string &line)
     if (line.find("GET_FOLLOWER_STATE") != std::string::npos)
     {
         send_follower_state(client_sock);
+        return;
+    }
+
+    // 响应“GET_EE_STATE”请求：返回当前末端位姿 pe=[x,y,z,rx,ry,rz]
+    if (line.find("GET_EE_STATE") != std::string::npos)
+    {
+        send_ee_state(client_sock);
         return;
     }
 
@@ -484,6 +567,53 @@ void A10TcpServer::process_line(int client_sock, const std::string &line)
         catch (const std::exception& e)
         {
             std::cout << "SET_EE_DELTA parse error: " << e.what() << std::endl;
+        }
+        return;
+    }
+
+    // VR 遥操作绝对末端目标：actions 为 7D [x,y,z,rx,ry,rz(rad),gripper]，
+    // 直接替换内部 target_pm(不累加)，配合 Python 端"原点增量"实现零漂移。
+    if (line.find("SET_EE_TARGET") != std::string::npos)
+    {
+        const size_t j0 = line.find('{');
+        if (j0 == std::string::npos)
+        {
+            std::cout << "SET_EE_TARGET: missing JSON object" << std::endl;
+            return;
+        }
+        try
+        {
+            const nlohmann::json j = nlohmann::json::parse(line.substr(j0));
+            if (!j.contains("actions") || !j["actions"].is_array())
+            {
+                std::cout << "SET_EE_TARGET: need \"actions\" array" << std::endl;
+                return;
+            }
+            std::vector<double> v;
+            for (const auto& x : j["actions"])
+            {
+                if (x.is_number())
+                {
+                    v.push_back(x.get<double>());
+                }
+            }
+            while (v.size() < 7)
+            {
+                v.push_back(0.0);
+            }
+            if (v.size() > 7)
+            {
+                v.resize(7);
+            }
+            {
+                std::lock_guard<std::mutex> lk(ee_target_mutex_);
+                target_ee_absolute_ = std::move(v);
+            }
+            (void)ee_target_seq_.fetch_add(1, std::memory_order_acq_rel);
+        }
+        catch (const std::exception& e)
+        {
+            std::cout << "SET_EE_TARGET parse error: " << e.what() << std::endl;
         }
         return;
     }

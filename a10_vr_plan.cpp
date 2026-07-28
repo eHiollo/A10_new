@@ -26,6 +26,7 @@ void request_vr_teleop_stop()
     if (g_tcp_server != nullptr)
     {
         g_tcp_server->clear_ee_delta_target_nrt();
+        g_tcp_server->clear_ee_target_nrt();
     }
 }
 
@@ -78,6 +79,15 @@ void rotvec_to_rm(const double* w, double* R_out)
     }
     const double axis[3] = {w[0] / theta, w[1] / theta, w[2] / theta};
     rtb::math::rodrigues(axis, theta, R_out);
+}
+
+/// pe=[x,y,z,rx,ry,rz(rad)] -> pm(4x4 齐次矩阵, 16 double, 行主序)。
+void pe_to_pm(const double* pe, double* pm_out)
+{
+    double d[3] = {pe[0], pe[1], pe[2]};
+    double R[9]{};
+    rotvec_to_rm(pe + 3, R);
+    rtb::math::compose_transform(R, d, pm_out);
 }
 
 void filter_trans_delta(double* d)
@@ -203,6 +213,7 @@ struct A10VrDriver::Imp
     double ik_joints[k_joint_num]{};
     double output_joints[k_joint_num]{};
     std::uint64_t consumed_ee_delta_seq_{0};
+    std::uint64_t consumed_ee_target_seq_{0};
     bool inited_{false};
 
     double max_lin_vel_{0.15};
@@ -224,6 +235,7 @@ auto A10VrDriver::prepareNrt() -> void
 {
     imp_->inited_ = false;
     imp_->consumed_ee_delta_seq_ = 0;
+    imp_->consumed_ee_target_seq_ = 0;
     g_a10_vr_stop_requested.store(false, std::memory_order_release);
 
     for (auto& m : motorOptions())
@@ -237,6 +249,10 @@ auto A10VrDriver::prepareNrt() -> void
     imp_->follower.setMaxAngVel(imp_->max_ang_vel_);
     imp_->follower.setMaxAngAcc(imp_->max_ang_acc_);
     clear_vr_grip_cmd();
+    if (g_tcp_server != nullptr)
+    {
+        g_tcp_server->clear_ee_target_nrt();
+    }
 }
 
 auto A10VrDriver::executeRT() -> int
@@ -299,6 +315,16 @@ auto A10VrDriver::executeRT() -> int
     ee.updP();
     ee.getMpm(T_base_to_ee);
 
+    // 发布当前末端位姿(pe)给 TCP server，供 Python 端 GET_EE_STATE 读取。
+    {
+        double pe_now[6]{};
+        rtb::math::pm2pe(T_base_to_ee, pe_now);
+        if (g_tcp_server != nullptr)
+        {
+            g_tcp_server->update_ee_pose(pe_now);
+        }
+    }
+
     if (!imp_->inited_)
     {
         {
@@ -350,6 +376,29 @@ auto A10VrDriver::executeRT() -> int
             apply_vr_delta_rotvec_from_target(imp_->target_pm, delta);
             imp_->follower.setTargetPm(imp_->target_pm);
             imp_->follower.setTargetVa(k_zero_va);
+        }
+    }
+
+    // 绝对末端目标(SET_EE_TARGET)：直接替换 target_pm(不累加)，实现 Python 端
+    // "原点增量"闭环——VR 静止时 target 不变，SE3Follower 收敛后机器人停住，零漂移。
+    {
+        std::vector<double> target_abs;
+        std::uint64_t tseq = 0;
+        if (g_tcp_server->fetch_ee_target_if_updated(target_abs, tseq, imp_->consumed_ee_target_seq_))
+        {
+            imp_->consumed_ee_target_seq_ = tseq;
+            if (target_abs.size() >= 7)
+            {
+                set_vr_grip_cmd(target_abs[6]);
+            }
+            if (target_abs.size() >= 6)
+            {
+                double pm_abs[16]{};
+                pe_to_pm(target_abs.data(), pm_abs);
+                std::memcpy(imp_->target_pm, pm_abs, sizeof(imp_->target_pm));
+                imp_->follower.setTargetPm(imp_->target_pm);
+                imp_->follower.setTargetVa(k_zero_va);
+            }
         }
     }
 
