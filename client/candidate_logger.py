@@ -40,15 +40,23 @@ class CandidateLogger:
         candidates: np.ndarray,
         best_index: int,
         divergence: float,
-        per_candidate_mean_dist: np.ndarray,
+        per_candidate_score: np.ndarray,
+        verifier: str = "medoid",
     ) -> None:
+        """写入一条记录。
+
+        ``per_candidate_score``: medoid 模式为各候选到其他候选的平均距离（越小越优），
+        critic 模式为锦标赛胜场数（越大越优）；``verifier`` 字段标明口径。
+        ``divergence`` 两种模式均为几何口径（跨实现一致, 驱动 adaptive N）。
+        """
         record = {
             "cycle": int(cycle),
             "t": round(time.time(), 3),
             "sample_n": int(candidates.shape[0]),
+            "verifier": verifier,
             "best_index": int(best_index),
             "divergence": round(float(divergence), 6),
-            "per_cand_mean": np.round(np.asarray(per_candidate_mean_dist, dtype=np.float64), 6).tolist(),
+            "per_cand_score": np.round(np.asarray(per_candidate_score, dtype=np.float64), 6).tolist(),
             "candidates": np.round(np.asarray(candidates, dtype=np.float64), self._ndigits).tolist(),
         }
         line = json.dumps(record, ensure_ascii=False)

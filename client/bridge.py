@@ -20,7 +20,7 @@ if _HERE not in sys.path:
 from openpi_ws_client import OpenPIWebsocketClient
 from robot_tcp_client import RobotTcpClient
 from usb_camera import CameraConfig, USBCamera
-from verifier import GeometricMedoidVerifier
+from verifier import GeometricMedoidVerifier, compute_divergence
 from candidate_logger import CandidateLogger
 
 logger = logging.getLogger(__name__)
@@ -87,6 +87,11 @@ class BridgeConfig:
     # AsyncVLA：候选记录目录（None=不记录）；pilot 时开启以分析 divergence
     # 分布与维度构成（校准夹爪权重）。
     log_candidates_dir: str | None = None
+    # AsyncVLA verifier 选择：medoid=L1 几何一致性(零训练, 保底)；
+    # critic=L2 学习式 Relative Action Critic(需 --critic-checkpoint, torch CPU 推理)。
+    verifier_type: str = "medoid"  # "medoid" | "critic"
+    critic_checkpoint: str | None = None
+    critic_device: str = "cpu"
     # AsyncVLA adaptive N：开启后忽略 sample_n，按 divergence EMA 在
     # {1,2,4,8} 档位间切换（离散档位 + 滞后降档，避免频繁触发服务端
     # jit 重编译）。阈值单位与 verifier divergence 一致，pilot 后用
@@ -124,7 +129,19 @@ class PiRobotBridge:
         # AsyncVLA L1 verifier：夹爪维度（最后一维）降权，其余维度等权。
         dim_weights = np.ones(cfg.action_dim, dtype=np.float64)
         dim_weights[-1] = cfg.verifier_gripper_weight
+        self._dim_weights = dim_weights
         self._verifier = GeometricMedoidVerifier(dim_weights=dim_weights)
+        # L2 critic（可选）：与 L1 并存，--verifier 切换；divergence 始终用
+        # 几何口径（critic 无天然分歧度, adaptive N 与日志需要跨实现一致的信号）。
+        self._critic = None
+        if cfg.verifier_type == "critic":
+            if not cfg.critic_checkpoint:
+                raise ValueError("--verifier critic 需要 --critic-checkpoint 指定 checkpoint 路径")
+            from critic_verifier import RelativeCriticVerifier
+
+            self._critic = RelativeCriticVerifier(cfg.critic_checkpoint, device=cfg.critic_device)
+        elif cfg.verifier_type != "medoid":
+            raise ValueError(f"unknown verifier_type: {cfg.verifier_type}")
         self._infer_count = 0
         self._cand_logger: CandidateLogger | None = None
         if cfg.log_candidates_dir:
@@ -221,24 +238,33 @@ class PiRobotBridge:
 
         result = self._ws.infer(obs, sample_n=n)
         candidates = _extract_action_candidates(result, expected_dim=self._cfg.action_dim)
-        vr = self._verifier.select(candidates)
+        if self._critic is not None:
+            best_index, score = self._critic.select(state_7d[0], candidates)
+            divergence = compute_divergence(candidates, self._dim_weights)
+        else:
+            vr = self._verifier.select(candidates)
+            best_index, score, divergence = vr.best_index, vr.per_candidate_mean_dist, vr.divergence
         self._infer_count += 1
         if self._cand_logger is not None:
             try:
-                self._cand_logger.log(self._infer_count, candidates, vr.best_index, vr.divergence, vr.per_candidate_mean_dist)
+                self._cand_logger.log(
+                    self._infer_count, candidates, best_index, divergence, score,
+                    verifier=self._cfg.verifier_type,
+                )
             except Exception:  # noqa: BLE001
                 logger.exception("候选记录写入失败（不影响主流程）。")
         if self._cfg.adaptive_n:
-            self._update_adaptive_n(vr.divergence)
+            self._update_adaptive_n(divergence)
         if self._infer_count % 20 == 0:
             logger.info(
-                "verifier: N=%d best=%d divergence=%.4f per_cand_mean=%s",
+                "verifier[%s]: N=%d best=%d divergence=%.4f score=%s",
+                self._cfg.verifier_type,
                 candidates.shape[0],
-                vr.best_index,
-                vr.divergence,
-                np.array2string(vr.per_candidate_mean_dist, precision=4, suppress_small=True),
+                best_index,
+                divergence,
+                np.array2string(np.asarray(score, dtype=np.float64), precision=4, suppress_small=True),
             )
-        return vr.best
+        return candidates[best_index]
 
     def run_forever(self) -> None:
         if self._cfg.mode == "async":
@@ -489,6 +515,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="AsyncVLA verifier: 夹爪维度权重(夹爪 mm 量级远大于关节 rad, 降权避免主导距离)。",
     )
     parser.add_argument(
+        "--verifier",
+        type=str,
+        default="medoid",
+        choices=["medoid", "critic"],
+        help="AsyncVLA verifier: medoid=L1 几何一致性(默认, 零训练); critic=L2 学习式 RAC(需 --critic-checkpoint)。",
+    )
+    parser.add_argument("--critic-checkpoint", type=str, default=None, help="L2 critic checkpoint 路径 (train_relative_critic 输出的 best.pt)。")
+    parser.add_argument("--critic-device", type=str, default="cpu", help="L2 critic 推理设备 (MLP 很小, CPU 足够)。")
+    parser.add_argument(
         "--log-candidates",
         type=str,
         default=None,
@@ -557,6 +592,9 @@ def run_from_args(args: argparse.Namespace) -> None:
             sample_n=max(1, int(args.sample_n)),
             verifier_gripper_weight=float(args.verifier_gripper_weight),
             log_candidates_dir=args.log_candidates if args.log_candidates else None,
+            verifier_type=str(args.verifier),
+            critic_checkpoint=args.critic_checkpoint,
+            critic_device=str(args.critic_device),
             adaptive_n=bool(args.adaptive_n),
             div_low=float(args.div_low),
             div_mid=float(args.div_mid),

@@ -32,6 +32,39 @@ class VerificationResult:
     per_candidate_mean_dist: np.ndarray = field(repr=False)
 
 
+def _resolve_weights(dim_weights: np.ndarray | None, action_dim: int) -> np.ndarray:
+    if dim_weights is None:
+        return np.ones(action_dim, dtype=np.float64)
+    w = np.asarray(dim_weights, dtype=np.float64).reshape(-1)
+    if w.shape[0] != action_dim:
+        raise ValueError(f"dim_weights length {w.shape[0]} != action dim {action_dim}")
+    return w
+
+
+def pairwise_dist_matrix(candidates: np.ndarray, dim_weights: np.ndarray | None = None) -> np.ndarray:
+    """候选两两加权 L2 距离矩阵 (N, N)：逐维加权后对 horizon 取均值。"""
+    c = np.asarray(candidates, dtype=np.float64)
+    if c.ndim != 3:
+        raise ValueError(f"Expected candidates with shape (N, T, D), got {c.shape}")
+    w = _resolve_weights(dim_weights, c.shape[-1])
+    diff = (c[:, None, :, :] - c[None, :, :, :]) * w
+    return np.linalg.norm(diff, axis=-1).mean(axis=-1)
+
+
+def compute_divergence(candidates: np.ndarray, dim_weights: np.ndarray | None = None) -> float:
+    """分歧度 = 两两距离均值（排除对角零值，取严格上三角）。
+
+    含对角会让零值占比随 N 变化（N=2 时 50%、N=8 时 12.5%），导致不同
+    采样数下的 divergence 口径不一致；排除后跨 N 可比，才能作为
+    adaptive sample_n / HIL 求助的统一触发信号。N=1 时无候选对, 返回 0。
+    """
+    c = np.asarray(candidates, dtype=np.float64)
+    if c.shape[0] < 2:
+        return 0.0
+    dist = pairwise_dist_matrix(c, dim_weights)
+    return float(dist[np.triu_indices(c.shape[0], k=1)].mean())
+
+
 class GeometricMedoidVerifier:
     """L1 几何一致性 medoid 验证器。
 
@@ -56,24 +89,11 @@ class GeometricMedoidVerifier:
                 per_candidate_mean_dist=np.zeros(1, dtype=np.float64),
             )
 
-        w = self._w
-        if w is None:
-            w = np.ones(c.shape[-1], dtype=np.float64)
-        elif w.shape[0] != c.shape[-1]:
-            raise ValueError(f"dim_weights length {w.shape[0]} != action dim {c.shape[-1]}")
-
-        # (N, N, T, D) 两两差 → 加权 L2 沿 D 聚合 → 对 T 取均值 → (N, N)
-        diff = (c[:, None, :, :] - c[None, :, :, :]) * w
-        dist = np.linalg.norm(diff, axis=-1).mean(axis=-1)
+        dist = pairwise_dist_matrix(c, self._w)
 
         # 对角线为 0，除以 n-1 得到每个候选到其他候选的平均距离。
         per_cand = dist.sum(axis=1) / (n - 1)
         best_idx = int(np.argmin(per_cand))
-
-        # 分歧度 = 两两距离均值（排除对角零值，取严格上三角）。
-        # 含对角会让零值占比随 N 变化（N=2 时 50%、N=8 时 12.5%），
-        # 导致不同采样数下的 divergence 口径不一致；排除后跨 N 可比，
-        # 才能作为 adaptive sample_n / HIL 求助的统一触发信号。
         divergence = float(dist[np.triu_indices(n, k=1)].mean())
 
         return VerificationResult(
