@@ -111,13 +111,14 @@ int main(int argc, char *argv[]){
             }
             current_q[12] = a10_tcp::g_vr_grip_actual_mm.load(std::memory_order_acquire);
 
-            // chunk 执行期间不刷新 ``robot_q_``，客户端应轮询 ``GET_POLICY_STATUS`` 至 idle 后再 ``GET_FOLLOWER_STATE`` 做观测/推理。
-            if (g_tcp_server != nullptr && !g_tcp_server->policy_batch_queue_empty())
+            // 始终刷新 TCP 侧 robot_q_（仅用于 GET_FOLLOWER_STATE 查询，不影响电机目标）。
+            // 之前 batch 执行期间会跳过刷新，导致异步推理在 batch 末尾取到陈旧状态；
+            // 现在保持刷新，让客户端在 batch 执行中也能读到接近实时的关节状态做观测。
+            // 注意：send_set_joints 只更新查询缓冲，不下发电机指令，与 RT 执行互不干扰。
+            if (g_tcp_server != nullptr)
             {
-                continue;
+                tcp_server.send_set_joints(current_q);
             }
-
-            tcp_server.send_set_joints(current_q);
         }
     });
     state_update_thread.detach();

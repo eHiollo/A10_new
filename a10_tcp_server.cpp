@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "kaanh/general/json.hpp"
+#include "a10_policy_tcp_plan.hpp"  // g_a10_policy_tcp_stop_requested (用于 STOP_POLICY)
 
 A10TcpServer::A10TcpServer()
   : server_sockfd_(-1), running_(false)
@@ -439,6 +440,17 @@ void A10TcpServer::process_line(int client_sock, const std::string &line)
     if (line.find("GET_POLICY_STATUS") != std::string::npos)
     {
         send_policy_status(client_sock);
+        return;
+    }
+
+    // 异步桥接器优雅停止：清空 batch 队列并请求 policy/vr 驱动退出。
+    // 复用 A10PolicyTcpCliStop 的停止语义（置位 g_a10_policy_tcp_stop_requested + 清缓冲），
+    // 让运行中的 RT 驱动下一拍退出，机器人停在当前位置。
+    if (line.find("STOP_POLICY") != std::string::npos)
+    {
+        g_a10_policy_tcp_stop_requested.store(true, std::memory_order_release);
+        clear_policy_tcp_targets_nrt();
+        send_line_to_client(client_sock, std::string("{\"stopped\":true}\n"));
         return;
     }
 
