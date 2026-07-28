@@ -122,14 +122,32 @@ class RobotTcpClient:
         t0 = time.time()
         while time.time() - t0 < timeout_s:
             st = self.get_policy_status()
+            rem = st.get("remaining")
+            if rem is None:
+                # 服务端未返回 remaining：视为异常，避免死等超时。
+                raise RuntimeError(f"GET_POLICY_STATUS missing 'remaining': {st!r}")
             try:
-                rem = int(st.get("remaining", -1))
+                rem = int(rem)
             except (TypeError, ValueError):
-                rem = -1
+                raise RuntimeError(f"GET_POLICY_STATUS 'remaining' not int: {st!r}")
             if rem == 0:
                 return
             time.sleep(poll_s)
         raise TimeoutError(f"wait_policy_idle exceeded {timeout_s}s")
+
+    def stop_policy(self) -> None:
+        """发送 ``STOP_POLICY``：清空 batch 队列并请求 policy/vr 驱动退出，机器人停在当前位置。"""
+        with self._lock:
+            try:
+                self._send_line("STOP_POLICY\n")
+                ack_raw = self._recv_line()
+                ack = json.loads(ack_raw)
+                if not ack.get("stopped", False):
+                    raise RuntimeError(f"STOP_POLICY not acknowledged by robot: {ack!r}")
+            except Exception:  # noqa: BLE001
+                logger.exception("Robot TCP STOP_POLICY failed.")
+                self.close()
+                raise
 
     def send_policy_actions_batch(self, actions: np.ndarray) -> None:
         """发送 ``SET_JOINTS_BATCH`` 一行：``actions`` 为 ``(T, D)`` numpy。"""
