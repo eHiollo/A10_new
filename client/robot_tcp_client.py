@@ -117,14 +117,23 @@ class RobotTcpClient:
         """查询 ``target_q_batch_`` 是否已执行完：``{"idle": bool, "remaining": int}``。"""
         return self._request_json("GET_POLICY_STATUS")
 
-    def wait_policy_idle(self, poll_s: float = 0.005, timeout_s: float = 120.0) -> None:
-        """轮询直到 ``remaining==0``（机器人 RT 已逐步执行完当前 batch）。"""
+    def wait_policy_idle(
+        self,
+        poll_s: float = 0.005,
+        timeout_s: float = 120.0,
+        should_stop=None,
+    ) -> None:
+        """轮询直到 ``remaining==0``（机器人 RT 已逐步执行完当前 batch）。
+
+        ``should_stop`` 为可选的无参回调, 返回 True 时立即提前返回(用于响应桥接器停止)。
+        """
         t0 = time.time()
         while time.time() - t0 < timeout_s:
+            if should_stop is not None and should_stop():
+                return
             st = self.get_policy_status()
             rem = st.get("remaining")
             if rem is None:
-                # 服务端未返回 remaining：视为异常，避免死等超时。
                 raise RuntimeError(f"GET_POLICY_STATUS missing 'remaining': {st!r}")
             try:
                 rem = int(rem)

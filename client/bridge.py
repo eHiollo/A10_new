@@ -87,6 +87,10 @@ class PiRobotBridge:
         self._top_cam = top_cam
         self._cfg = cfg
         self._stop = threading.Event()
+        # async 模式的 action buffer 与条件变量(实例化以便 stop() 能唤醒等待者)。
+        self._async_buffer: collections.deque[np.ndarray] = collections.deque()
+        self._async_buffer_lock = threading.Lock()
+        self._async_buffer_not_empty = threading.Condition(self._async_buffer_lock)
 
     def _build_observation(self, state_7d: np.ndarray) -> dict[str, Any]:
         right_rgb = self._right_cam.read_rgb()
@@ -140,7 +144,10 @@ class PiRobotBridge:
                 self._robot.wait_policy_idle(
                     poll_s=self._cfg.idle_poll_s,
                     timeout_s=self._cfg.idle_timeout_s,
+                    should_stop=self._stop.is_set,
                 )
+                if self._stop.is_set():
+                    break
                 if self._cfg.post_idle_settle_s > 0:
                     time.sleep(self._cfg.post_idle_settle_s)
 
@@ -180,9 +187,9 @@ class PiRobotBridge:
 
         观测比同步模式陈旧约 1 个 chunk（open-loop chunk 执行的标准权衡）。
         """
-        buffer: collections.deque[np.ndarray] = collections.deque()
-        buffer_lock = threading.Lock()
-        buffer_not_empty = threading.Condition(buffer_lock)
+        buffer = self._async_buffer
+        buffer_lock = self._async_buffer_lock
+        buffer_not_empty = self._async_buffer_not_empty
         infer_cycle = 0
 
         if self._cfg.start_delay_s > 0:
@@ -218,7 +225,6 @@ class PiRobotBridge:
 
         # 主循环 = Pusher：取已推理好的 chunk 推送，等执行完，循环。
         while not self._stop.is_set():
-            t_cycle = time.time()
             try:
                 with buffer_lock:
                     while len(buffer) == 0 and not self._stop.is_set():
@@ -236,7 +242,10 @@ class PiRobotBridge:
                 self._robot.wait_policy_idle(
                     poll_s=self._cfg.idle_poll_s,
                     timeout_s=self._cfg.idle_timeout_s,
+                    should_stop=self._stop.is_set,
                 )
+                if self._stop.is_set():
+                    break
                 if self._cfg.post_idle_settle_s > 0:
                     time.sleep(self._cfg.post_idle_settle_s)
 
@@ -255,6 +264,9 @@ class PiRobotBridge:
 
     def stop(self) -> None:
         self._stop.set()
+        # 唤醒可能阻塞在 buffer 条件变量上的 inferencer / pusher, 让它们立即看到 stop。
+        with self._async_buffer_lock:
+            self._async_buffer_not_empty.notify_all()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
