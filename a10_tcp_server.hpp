@@ -61,6 +61,7 @@ private:
     void send_leader_state(int client_sock);
     void send_follower_state(int client_sock);
     void send_ee_state(int client_sock);
+    void send_state(int client_sock);
     void process_line(int client_sock, const std::string& line);
 
     int server_sockfd_;

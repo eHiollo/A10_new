@@ -441,9 +441,9 @@ void A10TcpServer::send_follower_state(int client_sock)
         current_q = robot_q_;
     }
     
-    if (current_q.size() < 12)
+    if (current_q.size() < 13)
     {
-        current_q.resize(12, 0.0);
+        current_q.resize(13, 0.0);
     }
 
     //发送七维数据出去
@@ -496,12 +496,63 @@ void A10TcpServer::send_ee_state(int client_sock)
     send_line_to_client(client_sock, payload);
 }
 
+void A10TcpServer::send_state(int client_sock)
+{
+    // 合并响应：一次返回关节 q 与末端 ee，省一次往返。
+    // q: 7 关节 + 第 12 维夹爪(与 send_follower_state 一致)；ee: 6D pe 或 null。
+    std::vector<double> current_q;
+    {
+        std::lock_guard<std::mutex> lk(robot_q_mutex_);
+        current_q = robot_q_;
+    }
+    if (current_q.size() < 13)
+    {
+        current_q.resize(13, 0.0);
+    }
+
+    std::string payload = "{\"q\": [";
+    for (size_t i = 0; i < 7; ++i)
+    {
+        if (i) payload += ", ";
+        payload += std::to_string(current_q[i]);
+    }
+    payload += ", ";
+    payload += std::to_string(current_q[12]);
+    payload += "], \"ee\": ";
+
+    std::vector<double> pe;
+    if (get_ee_pose(pe))
+    {
+        payload += "[";
+        for (std::size_t i = 0; i < pe.size() && i < 6; ++i)
+        {
+            if (i) payload += ", ";
+            payload += std::to_string(pe[i]);
+        }
+        payload += "]";
+    }
+    else
+    {
+        payload += "null";
+    }
+    payload += "}\n";
+
+    send_line_to_client(client_sock, payload);
+}
+
 void A10TcpServer::process_line(int client_sock, const std::string &line)
 {
     // 响应“”GET_LEADER_STATE”请求
     if (line.find("GET_LEADER_STATE") != std::string::npos)
     {
         send_leader_state(client_sock);
+        return;
+    }
+
+    // 响应“GET_STATE”请求：一次返回 {q, ee}，省一次往返（target 模式用）。
+    if (line.find("GET_STATE") != std::string::npos)
+    {
+        send_state(client_sock);
         return;
     }
 
