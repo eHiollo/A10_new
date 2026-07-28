@@ -20,6 +20,7 @@ if _HERE not in sys.path:
 from openpi_ws_client import OpenPIWebsocketClient
 from robot_tcp_client import RobotTcpClient
 from usb_camera import CameraConfig, USBCamera
+from verifier import GeometricMedoidVerifier
 
 logger = logging.getLogger(__name__)
 
@@ -33,27 +34,34 @@ def _normalize_state_7d(values: list[float]) -> np.ndarray:
     return np.ascontiguousarray(out.reshape(1, 7), dtype=np.float32)
 
 
-def _extract_action_chunk(result: dict[str, Any], expected_dim: int = 7) -> np.ndarray:
+def _extract_action_candidates(result: dict[str, Any], expected_dim: int = 7) -> np.ndarray:
+    """从推理响应中抽取候选集，统一为 ``(N, T, D)``（N>1 为 AsyncVLA 批量采样）。"""
     if "actions" not in result:
         raise KeyError(f"OpenPI response missing 'actions'. keys={list(result.keys())}")
 
     actions = np.asarray(result["actions"], dtype=np.float32)
     if actions.ndim == 1:
-        actions = actions[None, :]
-    elif actions.ndim == 3:
-        if actions.shape[0] != 1:
-            raise ValueError(f"Unexpected action shape: {actions.shape}")
-        actions = actions[0]
-    elif actions.ndim != 2:
+        actions = actions[None, None, :]
+    elif actions.ndim == 2:
+        actions = actions[None, :, :]
+    elif actions.ndim != 3:
         raise ValueError(f"Unexpected action shape: {actions.shape}")
 
     if actions.shape[-1] < expected_dim:
         raise ValueError(f"Action dim too small: {actions.shape[-1]}, expected >= {expected_dim}")
 
     if actions.shape[-1] > expected_dim:
-        actions = actions[:, :expected_dim]
+        actions = actions[..., :expected_dim]
 
     return np.ascontiguousarray(actions, dtype=np.float32)
+
+
+def _extract_action_chunk(result: dict[str, Any], expected_dim: int = 7) -> np.ndarray:
+    """单次采样路径：要求响应恰含 1 个 chunk，返回 ``(T, D)``。"""
+    candidates = _extract_action_candidates(result, expected_dim)
+    if candidates.shape[0] != 1:
+        raise ValueError(f"Unexpected action shape: expected single chunk, got {candidates.shape}")
+    return candidates[0]
 
 
 @dataclass
@@ -70,6 +78,11 @@ class BridgeConfig:
     buffer_target: int = 1
     # async 模式专用：buffer 已满时 Inferencer 的轮询间隔。
     infer_backoff_s: float = 0.005
+    # AsyncVLA：每次推理采样的候选 chunk 数（1=原单次采样行为）。
+    sample_n: int = 1
+    # AsyncVLA verifier：夹爪维度权重（夹爪为 mm 绝对位置，量级远大于关节 rad，
+    # 不加权会主导候选间距离）。
+    verifier_gripper_weight: float = 0.03
 
 
 class PiRobotBridge:
@@ -91,6 +104,11 @@ class PiRobotBridge:
         self._async_buffer: collections.deque[np.ndarray] = collections.deque()
         self._async_buffer_lock = threading.Lock()
         self._async_buffer_not_empty = threading.Condition(self._async_buffer_lock)
+        # AsyncVLA L1 verifier：夹爪维度（最后一维）降权，其余维度等权。
+        dim_weights = np.ones(cfg.action_dim, dtype=np.float64)
+        dim_weights[-1] = cfg.verifier_gripper_weight
+        self._verifier = GeometricMedoidVerifier(dim_weights=dim_weights)
+        self._infer_count = 0
 
     def _build_observation(self, state_7d: np.ndarray) -> dict[str, Any]:
         right_rgb = self._right_cam.read_rgb()
@@ -110,10 +128,29 @@ class PiRobotBridge:
         }
 
     def _infer_chunk(self, state_7d: np.ndarray) -> np.ndarray:
-        """采集观测并推理，返回 ``(T, action_dim)`` action chunk。"""
+        """采集观测并推理，返回 ``(T, action_dim)`` action chunk。
+
+        sample_n > 1 时走 AsyncVLA 路径：服务端单次 batch 采样 N 个候选，
+        本地 L1 verifier（几何一致性 medoid）选优并记录分歧度。
+        """
         obs = self._build_observation(state_7d)
-        result = self._ws.infer(obs)
-        return _extract_action_chunk(result, expected_dim=self._cfg.action_dim)
+        if self._cfg.sample_n <= 1:
+            result = self._ws.infer(obs)
+            return _extract_action_chunk(result, expected_dim=self._cfg.action_dim)
+
+        result = self._ws.infer(obs, sample_n=self._cfg.sample_n)
+        candidates = _extract_action_candidates(result, expected_dim=self._cfg.action_dim)
+        vr = self._verifier.select(candidates)
+        self._infer_count += 1
+        if self._infer_count % 20 == 0:
+            logger.info(
+                "verifier: N=%d best=%d divergence=%.4f per_cand_mean=%s",
+                candidates.shape[0],
+                vr.best_index,
+                vr.divergence,
+                np.array2string(vr.per_candidate_mean_dist, precision=4, suppress_small=True),
+            )
+        return vr.best
 
     def run_forever(self) -> None:
         if self._cfg.mode == "async":
@@ -349,6 +386,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         help="async 模式: buffer 期望缓冲的 chunk 数(双缓冲=1)。",
     )
+    parser.add_argument(
+        "--sample-n",
+        type=int,
+        default=1,
+        help="AsyncVLA: 每次推理采样的候选 chunk 数(服务端单次 batch 完成; 1=原单次采样)。",
+    )
+    parser.add_argument(
+        "--verifier-gripper-weight",
+        type=float,
+        default=0.03,
+        help="AsyncVLA verifier: 夹爪维度权重(夹爪 mm 量级远大于关节 rad, 降权避免主导距离)。",
+    )
     return parser
 
 
@@ -399,6 +448,8 @@ def run_from_args(args: argparse.Namespace) -> None:
             post_idle_settle_s=max(0.0, float(args.post_idle_settle)),
             mode=str(args.mode),
             buffer_target=max(1, int(args.buffer_target)),
+            sample_n=max(1, int(args.sample_n)),
+            verifier_gripper_weight=float(args.verifier_gripper_weight),
         ),
     )
 

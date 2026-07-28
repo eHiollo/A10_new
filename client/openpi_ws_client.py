@@ -53,11 +53,20 @@ class OpenPIWebsocketClient:
                 logger.warning("OpenPI websocket connect failed (%s), retrying...", exc)
                 time.sleep(self._reconnect_interval_s)
 
-    def infer(self, observation: dict[str, Any]) -> dict[str, Any]:
+    def infer(self, observation: dict[str, Any], sample_n: int = 1) -> dict[str, Any]:
+        """请求推理。
+
+        sample_n > 1 时（AsyncVLA），服务端在同一 batch 内采样多组候选
+        action chunk 返回，``actions`` 形状为 (sample_n, T, D)；默认 1，
+        协议与行为与原单次采样完全一致。
+        """
         if self._conn is None:
             self._connect()
 
         assert self._conn is not None
+        if sample_n > 1:
+            observation = dict(observation)
+            observation["sample_n"] = int(sample_n)
         try:
             payload = self._packer.pack(observation)
             self._conn.send(payload)
