@@ -1,0 +1,4 @@
+msgpack>=1.0.5
+numpy>=1.22.4,<2.0.0
+opencv-python>=4.8.0
+websockets>=11.0
