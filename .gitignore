@@ -6,3 +6,5 @@ client/__pycache__/
 client/**/__pycache__/
 client/camera_snaps/
 *.pyc
+# 本地登录凭据（含真实密码），勿提交
+a_passport_local.txt

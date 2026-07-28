@@ -1,4 +1,6 @@
-login --user=Manufacturer --pwd=df4fe8a8bcd5c95cdb640aa9793bb32b
+# 登录凭据请勿提交到仓库。将真实密码放入本地 gitignored 的 a_passport_local.txt，
+# 或通过环境变量 A10_LOGIN_PWD 注入。下面这行仅作占位示例。
+login --user=Manufacturer --pwd=${A10_LOGIN_PWD}
 机械臂CLI指令
     #回到初始姿态
         m_init -p=0/1/2/3/4
