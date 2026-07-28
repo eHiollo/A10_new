@@ -21,6 +21,7 @@ from openpi_ws_client import OpenPIWebsocketClient
 from robot_tcp_client import RobotTcpClient
 from usb_camera import CameraConfig, USBCamera
 from verifier import GeometricMedoidVerifier
+from candidate_logger import CandidateLogger
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,9 @@ class BridgeConfig:
     # AsyncVLA verifier：夹爪维度权重（夹爪为 mm 绝对位置，量级远大于关节 rad，
     # 不加权会主导候选间距离）。
     verifier_gripper_weight: float = 0.03
+    # AsyncVLA：候选记录目录（None=不记录）；pilot 时开启以分析 divergence
+    # 分布与维度构成（校准夹爪权重）。
+    log_candidates_dir: str | None = None
 
 
 class PiRobotBridge:
@@ -109,6 +113,9 @@ class PiRobotBridge:
         dim_weights[-1] = cfg.verifier_gripper_weight
         self._verifier = GeometricMedoidVerifier(dim_weights=dim_weights)
         self._infer_count = 0
+        self._cand_logger: CandidateLogger | None = None
+        if cfg.log_candidates_dir:
+            self._cand_logger = CandidateLogger(cfg.log_candidates_dir)
 
     def _build_observation(self, state_7d: np.ndarray) -> dict[str, Any]:
         right_rgb = self._right_cam.read_rgb()
@@ -142,6 +149,11 @@ class PiRobotBridge:
         candidates = _extract_action_candidates(result, expected_dim=self._cfg.action_dim)
         vr = self._verifier.select(candidates)
         self._infer_count += 1
+        if self._cand_logger is not None:
+            try:
+                self._cand_logger.log(self._infer_count, candidates, vr.best_index, vr.divergence, vr.per_candidate_mean_dist)
+            except Exception:  # noqa: BLE001
+                logger.exception("候选记录写入失败（不影响主流程）。")
         if self._infer_count % 20 == 0:
             logger.info(
                 "verifier: N=%d best=%d divergence=%.4f per_cand_mean=%s",
@@ -304,6 +316,8 @@ class PiRobotBridge:
         # 唤醒可能阻塞在 buffer 条件变量上的 inferencer / pusher, 让它们立即看到 stop。
         with self._async_buffer_lock:
             self._async_buffer_not_empty.notify_all()
+        if self._cand_logger is not None:
+            self._cand_logger.close()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -398,6 +412,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.03,
         help="AsyncVLA verifier: 夹爪维度权重(夹爪 mm 量级远大于关节 rad, 降权避免主导距离)。",
     )
+    parser.add_argument(
+        "--log-candidates",
+        type=str,
+        default=None,
+        help="AsyncVLA: 候选记录目录(jsonl, 含全量候选; pilot 分析用)。不传则不记录。",
+    )
     return parser
 
 
@@ -450,6 +470,7 @@ def run_from_args(args: argparse.Namespace) -> None:
             buffer_target=max(1, int(args.buffer_target)),
             sample_n=max(1, int(args.sample_n)),
             verifier_gripper_weight=float(args.verifier_gripper_weight),
+            log_candidates_dir=args.log_candidates if args.log_candidates else None,
         ),
     )
 
