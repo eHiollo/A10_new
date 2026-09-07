@@ -10,8 +10,9 @@ configure_file(${PROJECT_SOURCE_DIR}/config/kaanhbin_version.h.in kaanhbin_versi
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
+# 本机 /usr/kaanhbot 仅安装了 Debug 导入库；未指定时默认 Debug，避免 Release 链接失败
 if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release)
+    set(CMAKE_BUILD_TYPE Debug)
 endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY bin)
@@ -58,10 +59,18 @@ set(KAANHBIN_SOURCES
     tactile_collect_real.cpp
 )
 
-find_package(rtb QUIET PATHS 
+find_package(rtb QUIET PATHS
+    ${PROJECT_SOURCE_DIR}/vendor/rtb-1.0.0
     /usr/local/rtb/rtb-1.0.0
     /usr/rtb/rtb-1.0.0
 )
+if(NOT rtb_FOUND)
+    message(FATAL_ERROR "rtb not found. Place rtb-1.0.0 under vendor/rtb-1.0.0")
+endif()
+# 本机 kaanhbot 用 Debug，rtb 安装包只有 Release 导入配置
+if(TARGET rtb::rtb)
+    set_property(TARGET rtb::rtb PROPERTY MAP_IMPORTED_CONFIG_DEBUG RELEASE)
+endif()
 
 include_directories(${PROJECT_SOURCE_DIR})
 add_executable(kaanhbin ${KAANHBIN_SOURCES})
@@ -72,6 +81,10 @@ target_include_directories(kaanhbin PUBLIC
 target_link_libraries(kaanhbin PUBLIC 
     ${kaanhbot_LIBRARIES}
     ${rtb_LIBRARIES}
+)
+set_target_properties(kaanhbin PROPERTIES
+    BUILD_RPATH "${PROJECT_SOURCE_DIR}/vendor/rtb-1.0.0/lib"
+    INSTALL_RPATH "${PROJECT_SOURCE_DIR}/vendor/rtb-1.0.0/lib"
 )
 
 add_executable(client ${PROJECT_SOURCE_DIR}/client.cpp)
