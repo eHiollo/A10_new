@@ -5,6 +5,7 @@ examples/human_kaanhbin
 client/__pycache__/
 client/**/__pycache__/
 client/camera_snaps/
+client/stutter_logs/
 *.pyc
 # 本地登录凭据（含真实密码），勿提交
 a_passport_local.txt

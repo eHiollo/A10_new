@@ -222,3 +222,13 @@ class ThreadedCamera:
     def close(self) -> None:
         self._stop.set()
         self._thread.join(timeout=2.0)
+
+
+class DummyCamera:
+    """无相机占位：回放/无摄像头时不打开 USB。"""
+
+    def read_rgb(self) -> np.ndarray:
+        return np.zeros((224, 224, 3), dtype=np.uint8)
+
+    def close(self) -> None:
+        return

@@ -48,13 +48,12 @@ std::vector<double> read_follower_seven(aris::plan::Plan& plan)
             q[static_cast<std::size_t>(i)] = motors[mi].actualPos();
         }
     }
+    // 夹爪在 ethercat 上是 motor 12；没有该电机时保持 0。
+    // 禁止回退到 motor 6：那是主臂关节 0，|q6| 经常 > max_grip_delta(0.6)，
+    // 会在一个 RT 周期内把整段 follower batch 全部 skip 掉，机械臂完全不动。
     if (static_cast<aris::Size>(12) < n_motors)
     {
         q[6] = motors[12].actualPos();
-    }
-    else if (static_cast<aris::Size>(6) < n_motors)
-    {
-        q[6] = motors[6].actualPos();
     }
     return q;
 }
@@ -203,16 +202,8 @@ bool batch_keyframe_exceeds_threshold(
             return true;
         }
     }
-    if (q0.size() >= 7U && q1.size() >= 7U)
-    {
-        const double d = std::abs(q1[6] - q0[6]);
-        if (d > grip_max_delta)
-        {
-            *worst_axis = 6;
-            *worst_abs = d;
-            return true;
-        }
-    }
+    (void)grip_max_delta;
+    // 夹爪不参与 skip：无夹爪时 goal[6]=0，q0[6] 若读到其它电机会把整段轨迹一拍清掉。
     return false;
 }
 
@@ -251,6 +242,8 @@ struct A10PolicyTcpDriver::Imp
     /// batch 连续段采用“上一段 q1 作为下一段 q0”来减少段间回拉。
     std::vector<double> last_batch_q1_;
     bool has_last_batch_q1_{false};
+    /// 当前正在插值的那一段所属的 batch_seq；中途 SET 替换队列时与 commit_seq 不一致则从当前指令改接新队首。
+    std::uint64_t segment_commit_seq_{0};
     /// 一旦收到并执行过 policy batch，就不再回退到 legacy ``target_q_``，避免“走几步后回撤”。
     bool policy_batch_mode_{false};
 
@@ -261,6 +254,7 @@ struct A10PolicyTcpDriver::Imp
         last_legacy_target.clear();
         last_logged_batch_commit_seq_ = 0;
         active_batch_commit_seq_ = 0;
+        segment_commit_seq_ = 0;
         last_batch_q1_.clear();
         has_last_batch_q1_ = false;
         policy_batch_mode_ = false;
@@ -275,21 +269,39 @@ struct A10PolicyTcpDriver::Imp
 
         if (batch_seg.active)
         {
-            tick_segment_and_apply(batch_seg, self);
-            if (!batch_seg.active)
+            const std::uint64_t seq_now = g_tcp_server->policy_batch_commit_seq();
+            if (seq_now != segment_commit_seq_)
             {
-                g_tcp_server->pop_policy_batch_front();
+                // SET_JOINTS_BATCH 整队替换：旧队首已不在队列。从当前指令姿态接到新队首，
+                // 不要 pop（否则会丢掉新 chunk 的 actions[0]）。
+                last_batch_q1_ = lerp_q(batch_seg);
+                pad_seven(last_batch_q1_);
+                has_last_batch_q1_ = true;
+                batch_seg.active = false;
+                active_batch_commit_seq_ = seq_now;
+                segment_commit_seq_ = seq_now;
+                self.mout() << "policy: [batch] retarget mid-segment batch_seq=" << seq_now
+                             << " remaining=" << g_tcp_server->policy_batch_queue_size() << std::endl;
+                mout_vec7_line(self, "  blend_from_cmd=", last_batch_q1_);
             }
-            return;
+            else
+            {
+                tick_segment_and_apply(batch_seg, self);
+                if (!batch_seg.active)
+                {
+                    g_tcp_server->pop_policy_batch_front();
+                }
+                return;
+            }
         }
 
         std::vector<double> batch_goal;
         const std::uint64_t commit_seq_now = g_tcp_server->policy_batch_commit_seq();
+        // 新 batch 仍衔接上一段 q1。SET_JOINTS_BATCH 是整队替换，若这里清空 last_q1，
+        // 后续 chunk 会拿「当前实际姿态」比队首，前期几乎不动时队首相对复位姿态越来越大，触发 skip 雪崩。
         if (commit_seq_now != active_batch_commit_seq_)
         {
             active_batch_commit_seq_ = commit_seq_now;
-            has_last_batch_q1_ = false;
-            last_batch_q1_.clear();
         }
         constexpr int k_max_batch_skips_per_tick = 64;
         int batch_skips = 0;
@@ -364,6 +376,7 @@ struct A10PolicyTcpDriver::Imp
             start_segment(batch_seg, batch_goal, self, max_arm_vel_rad_s, max_gripper_vel, q0_seed, 2);
             last_batch_q1_ = batch_seg.q1;
             has_last_batch_q1_ = true;
+            segment_commit_seq_ = commit_seq;
             if (commit_seq != last_logged_batch_commit_seq_)
             {
                 last_logged_batch_commit_seq_ = commit_seq;

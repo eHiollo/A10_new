@@ -83,3 +83,18 @@ python3 capture_cameras.py --sources /dev/video0 /dev/video2
 - 机器人 TCP 默认端口 **8080**（与 `main.cpp` 一致）。
 - 异步模式下，`main.cpp` 的状态线程已改为 batch 执行期间也刷新 `robot_q_`，故推理线程在 batch 末尾也能取到接近实时的关节状态。
 - 停止：Ctrl+C 或发送 `STOP_POLICY` 命令，桥接器会请求机器人停止并清空 batch 队列。
+
+## 数据集回放（无 GPU / 相机 / 夹爪）
+
+用 `dataset_5_9` episode 15 的 `observation.state` 伪装成推理结果，延迟为 `clip(N(68.5, 0.7), 20, 150)` ms（本机 5090 实测分布）。不连 `serve_policy`、不打开相机。
+
+```bash
+python3 run_bridge.py \
+  --policy replay --mode async --no-camera \
+  --replay-dataset /path/to/dataset_5_9 \
+  --replay-episode 15 \
+  --robot-host 127.0.0.1 --robot-port 8080 \
+  --hz 0
+```
+
+日志中的 `gap_ms`：async 成功时应接近 0；`--mode sync` 时应接近 `infer_ms`（~68ms）。需要 `pyarrow` 读 parquet。
