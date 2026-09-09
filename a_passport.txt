@@ -1,3 +1,4 @@
+login --user=Manufacturer --pwd=d8330f857a17c53d217014ee776bfd50
 # 登录凭据请勿提交到仓库。将真实密码放入本地 gitignored 的 a_passport_local.txt，
 # 或通过环境变量 A10_LOGIN_PWD 注入。下面这行仅作占位示例。
 login --user=Manufacturer --pwd=${A10_LOGIN_PWD}
