@@ -448,7 +448,7 @@ void A10TcpServer::process_line(int client_sock, const std::string &line)
     // 让运行中的 RT 驱动下一拍退出，机器人停在当前位置。
     if (line.find("STOP_POLICY") != std::string::npos)
     {
-        g_a10_policy_tcp_stop_requested.store(true, std::memory_order_release);
+        a10_tcp::g_a10_policy_tcp_stop_requested.store(true, std::memory_order_release);
         clear_policy_tcp_targets_nrt();
         send_line_to_client(client_sock, std::string("{\"stopped\":true}\n"));
         return;
