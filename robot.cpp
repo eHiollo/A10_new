@@ -282,8 +282,10 @@ namespace robot
 
 	struct ModelInit::Imp{
 
-        // m_init：preset 0..5 对应六组初始关节目标
+        // m_init：preset 0..5 对应六组初始关节目标（仅前 6 维）
         int preset_index = 0;
+        // 后 6 维（未控臂）在指令开始时锁存 actualPos，之后保持不动
+        double unused_hold_q[6]{ 0 };
 
         //Flag
         bool init = false;
@@ -436,13 +438,30 @@ namespace robot
             imp_->preset_index = p;
             mout() << "m_init: preset=" << imp_->preset_index << std::endl;
 
+            for (int i = 0; i < 6; ++i)
+            {
+                imp_->unused_hold_q[i] = controller()->motorPool()[i + 6].actualPos();
+            }
+            mout() << "m_init: hold unused arm (motors 6-11) at "
+                   << imp_->unused_hold_q[0] << "\t" << imp_->unused_hold_q[1] << "\t"
+                   << imp_->unused_hold_q[2] << "\t" << imp_->unused_hold_q[3] << "\t"
+                   << imp_->unused_hold_q[4] << "\t" << imp_->unused_hold_q[5] << std::endl;
+
             getForceData(imp_->arm1_init_force, 0, imp_->init);
             getForceData(imp_->arm2_init_force, 1, imp_->init);
             master()->logFileRawName(std::string("/home/kaanh/Desktop/kaanhbin/force_comp_data/forceComp_" + aris::core::logFileTimeFormat(std::chrono::system_clock::now())).c_str());
             imp_->init = true;
         }
 
-        const double *const init_pos = k_init_preset_table[imp_->preset_index];
+        double init_pos[12]{ 0 };
+        {
+            const double *const preset = k_init_preset_table[imp_->preset_index];
+            for (int i = 0; i < 6; ++i)
+            {
+                init_pos[i] = preset[i];
+                init_pos[i + 6] = imp_->unused_hold_q[i];
+            }
+        }
 
         //6-12维反向
         // static double init_pos[12] =
@@ -520,7 +539,7 @@ namespace robot
 
         auto motorsPositionCheck = [=]()
         {
-            for(int i = 0; i < 12; i++)
+            for(int i = 0; i < 6; i++)
             {
                 if(std::fabs(current_angle[i]-init_pos[i])>=move)
                 {
@@ -533,7 +552,7 @@ namespace robot
 
 
 
-        for (int i = 0; i < 12; i++)
+        for (int i = 0; i < 6; i++)
         {
             if (current_angle[i] <= init_pos[i] - move)
             {
@@ -543,6 +562,10 @@ namespace robot
             {
                 controller()->motorPool()[i].setTargetPos(current_angle[i] - move);
             }
+        }
+        for (int i = 0; i < 6; ++i)
+        {
+            controller()->motorPool()[i + 6].setTargetPos(imp_->unused_hold_q[i]);
         }
 
 
