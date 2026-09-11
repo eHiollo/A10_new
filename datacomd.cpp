@@ -208,6 +208,10 @@ namespace data
     }
     auto HoleMove::executeRT() -> int
     {
+        if (!robot::require_dual_arm(*this, "m_hm"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white
@@ -1775,6 +1779,10 @@ namespace data
     }
     auto GetData::executeRT() -> int
     {
+        if (!robot::require_dual_arm(*this, "m_gd"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white
@@ -2742,6 +2750,10 @@ namespace data
     }
     auto GetHdData::executeRT() -> int
     {
+        if (!robot::require_dual_arm(*this, "m_ghd"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white

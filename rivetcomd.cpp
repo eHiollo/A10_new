@@ -39,6 +39,10 @@ namespace rivet
 
     }
     auto RivetInit::executeRT()->int {
+        if (!robot::require_dual_arm(*this, "r_init"))
+        {
+            return 0;
+        }
 
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
@@ -342,6 +346,10 @@ namespace rivet
     }
     auto RivetStart::executeRT() -> int
     {
+        if (!robot::require_dual_arm(*this, "r_start"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white
@@ -792,6 +800,10 @@ namespace rivet
 
     }
     auto Arm2Init::executeRT()->int {
+        if (!robot::require_dual_arm(*this, "2_back"))
+        {
+            return 0;
+        }
 
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
@@ -1088,6 +1100,10 @@ namespace rivet
     }
     auto RivetOut::executeRT() -> int
     {
+        if (!robot::require_dual_arm(*this, "r_out"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white
@@ -1565,6 +1581,10 @@ namespace rivet
     }
     auto RivetSearch::executeRT() -> int
     {
+        if (!robot::require_dual_arm(*this, "r_search"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white
@@ -2914,6 +2934,10 @@ namespace rivet
     }
     auto RivetHoleDection::executeRT() -> int
     {
+        if (!robot::require_dual_arm(*this, "r_hd"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white
@@ -4057,6 +4081,10 @@ namespace rivet
     }
     auto RivetCalib::executeRT() -> int
     {
+        if (!robot::require_dual_arm(*this, "r_calib"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white

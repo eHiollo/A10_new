@@ -341,9 +341,15 @@ struct A10VrVelDriver::Imp
     void apply_joints_to_motors(aris::plan::Plan& plan)
     {
         auto& motors = plan.controller()->motorPool();
+        const aris::Size n_motors = motors.size();
         for (int i = 0; i < k_joint_num; ++i)
         {
-            motors[k_motor_base + i].setTargetPos(output_joints[i]);
+            const int mi = k_motor_base + i;
+            if (static_cast<aris::Size>(mi) >= n_motors)
+            {
+                break;
+            }
+            motors[mi].setTargetPos(output_joints[i]);
         }
     }
 
@@ -402,6 +408,14 @@ auto A10VrVelDriver::executeRT() -> int
     }
 
     auto& motors = controller()->motorPool();
+    if (motors.size() < static_cast<aris::Size>(k_joint_num))
+    {
+        if (count() == 1)
+        {
+            mout() << "vr_vel: need " << k_joint_num << " motors, have " << motors.size() << std::endl;
+        }
+        return 0;
+    }
     auto& arm = arm_model(*this);
     auto& ee = ee_motion(*this);
 

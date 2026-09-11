@@ -69,8 +69,12 @@ namespace testSpace
 	}
 	auto ZeroG::executeRT() -> int
 	{
-		// dual transform modelbase into multimodel
 		auto &dualArm = dynamic_cast<aris::dynamic::MultiModel &>(modelBase()[0]);
+		if (dualArm.subModels().size() < 2)
+		{
+			mout() << "zerog: skipped on single-arm robot" << std::endl;
+			return 0;
+		}
 		// at(0) -> Arm1 -> white
 		auto &arm1 = dualArm.subModels().at(0);
 		// at(1) -> Arm2 -> blue

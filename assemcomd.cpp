@@ -208,6 +208,10 @@ namespace assemble
     }
     auto HoleInPeg::executeRT() -> int
     {
+        if (!robot::require_dual_arm(*this, "m_hp"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white
@@ -2033,6 +2037,10 @@ namespace assemble
     }
     auto PegInHole::executeRT() -> int
     {
+        if (!robot::require_dual_arm(*this, "m_ph"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white
@@ -3204,6 +3212,10 @@ namespace assemble
     }
     auto Insert::executeRT() -> int
     {
+        if (!robot::require_dual_arm(*this, "m_insert"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white

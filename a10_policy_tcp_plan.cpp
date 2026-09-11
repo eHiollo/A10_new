@@ -11,6 +11,7 @@
 
 #include "a10_tcp_server.hpp"
 #include "a10_vr_plan.hpp"
+#include "a10_gripper_bridge.hpp"
 
 extern A10TcpServer* g_tcp_server;
 
@@ -48,14 +49,8 @@ std::vector<double> read_follower_seven(aris::plan::Plan& plan)
             q[static_cast<std::size_t>(i)] = motors[mi].actualPos();
         }
     }
-    if (static_cast<aris::Size>(12) < n_motors)
-    {
-        q[6] = motors[12].actualPos();
-    }
-    else if (static_cast<aris::Size>(6) < n_motors)
-    {
-        q[6] = motors[6].actualPos();
-    }
+    // 夹爪是 USB BusServo，不是 EtherCAT 电机 6/12。
+    q[6] = g_vr_grip_actual_mm.load(std::memory_order_acquire);
     return q;
 }
 
@@ -78,9 +73,10 @@ void apply_seven_to_motors(aris::plan::Plan& plan, const std::vector<double>& q)
         motors[mi].setTargetPos(q[static_cast<std::size_t>(i)]);
     }
 
-    if (q.size() >= 7 && static_cast<aris::Size>(12) < n_motors)
+    // 夹爪走 USB BusServo，不占用 EtherCAT 电机。
+    if (q.size() >= 7)
     {
-        motors[12].setTargetPos(q[6]);
+        request_gripper_position_mm(q[6]);
     }
 }
 

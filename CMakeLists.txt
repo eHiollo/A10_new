@@ -10,9 +10,9 @@ configure_file(${PROJECT_SOURCE_DIR}/config/kaanhbin_version.h.in kaanhbin_versi
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
-# 本机 /usr/kaanhbot 仅安装了 Debug 导入库；未指定时默认 Debug，避免 Release 链接失败
+# 使用 /usr/*/lib/release（带 IgH EtherCAT）。未指定时默认 Release。
 if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Debug)
+    set(CMAKE_BUILD_TYPE Release)
 endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY bin)
@@ -67,7 +67,7 @@ find_package(rtb QUIET PATHS
 if(NOT rtb_FOUND)
     message(FATAL_ERROR "rtb not found. Place rtb-1.0.0 under vendor/rtb-1.0.0")
 endif()
-# 本机 kaanhbot 用 Debug，rtb 安装包只有 Release 导入配置
+# rtb 安装包只有 Release 导入配置；Debug 工程也映射到 Release
 if(TARGET rtb::rtb)
     set_property(TARGET rtb::rtb PROPERTY MAP_IMPORTED_CONFIG_DEBUG RELEASE)
 endif()
@@ -83,8 +83,13 @@ target_link_libraries(kaanhbin PUBLIC
     ${rtb_LIBRARIES}
 )
 set_target_properties(kaanhbin PROPERTIES
-    BUILD_RPATH "${PROJECT_SOURCE_DIR}/vendor/rtb-1.0.0/lib"
-    INSTALL_RPATH "${PROJECT_SOURCE_DIR}/vendor/rtb-1.0.0/lib"
+    BUILD_RPATH "${PROJECT_SOURCE_DIR}/vendor/rtb-1.0.0/lib;/opt/etherlab/lib;/usr/kaanhbot/kaanhbot-2.5.7/lib/release;/usr/kaanh/kaanh-2.5.7/lib/release;/usr/aris/aris-2.5.7/lib/release"
+    INSTALL_RPATH "${PROJECT_SOURCE_DIR}/vendor/rtb-1.0.0/lib;/opt/etherlab/lib;/usr/kaanhbot/kaanhbot-2.5.7/lib/release;/usr/kaanh/kaanh-2.5.7/lib/release;/usr/aris/aris-2.5.7/lib/release"
+)
+add_custom_command(TARGET kaanhbin POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${PROJECT_SOURCE_DIR}/kaanh.xml
+        $<TARGET_FILE_DIR:kaanhbin>/kaanh.xml
 )
 
 add_executable(client ${PROJECT_SOURCE_DIR}/client.cpp)

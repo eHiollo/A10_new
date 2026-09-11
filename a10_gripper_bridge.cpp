@@ -13,6 +13,7 @@ std::atomic<double> g_vr_grip_cmd{0.0};
 std::atomic<double> g_vr_grip_vel_mm_s{60.0};
 std::atomic<double> g_vr_grip_target_mm{0.0};
 std::atomic<double> g_vr_grip_actual_mm{0.0};
+std::atomic<bool> g_grip_pos_pending{false};
 
 void set_vr_grip_cmd(double cmd)
 {
@@ -34,6 +35,13 @@ void sync_vr_grip_target_from_actual(double mm)
     mm = std::clamp(mm, k_gripper_mm_min, k_gripper_mm_max);
     g_vr_grip_target_mm.store(mm, std::memory_order_release);
     g_vr_grip_actual_mm.store(mm, std::memory_order_release);
+}
+
+void request_gripper_position_mm(double mm)
+{
+    mm = std::clamp(mm, k_gripper_mm_min, k_gripper_mm_max);
+    g_vr_grip_target_mm.store(mm, std::memory_order_release);
+    g_grip_pos_pending.store(true, std::memory_order_release);
 }
 
 void run_gripper_service_loop(BusServo* gripper)
@@ -61,13 +69,21 @@ void run_gripper_service_loop(BusServo* gripper)
             continue;
         }
 
+        const bool pos_pending = g_grip_pos_pending.exchange(false, std::memory_order_acq_rel);
         const double cmd = g_vr_grip_cmd.load(std::memory_order_acquire);
         const double vmax = g_vr_grip_vel_mm_s.load(std::memory_order_acquire);
-        target_mm += cmd * vmax * k_dt;
+        if (pos_pending)
+        {
+            target_mm = g_vr_grip_target_mm.load(std::memory_order_acquire);
+        }
+        else
+        {
+            target_mm += cmd * vmax * k_dt;
+        }
         target_mm = std::clamp(target_mm, k_gripper_mm_min, k_gripper_mm_max);
         g_vr_grip_target_mm.store(target_mm, std::memory_order_release);
 
-        if (std::abs(cmd) >= 1e-9)
+        if (pos_pending || std::abs(cmd) >= 1e-9)
         {
             idle_ticks = 0;
             if (std::abs(target_mm - last_sent_mm) >= k_send_mm_eps)

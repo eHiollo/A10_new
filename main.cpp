@@ -96,18 +96,23 @@ int main(int argc, char *argv[]){
     }
     std::thread([]() { a10_tcp::run_gripper_service_loop(g_gripper); }).detach();
 
+    cs.init();
+
     // 独立线程：仅把**当前关节反馈**写入 TCP 侧 robot_q_，供外部 GET_FOLLOWER_STATE / GET_LEADER_STATE 查询。
-    // 与 TCP 下发的 target_q_（策略目标）是不同缓冲，不会互相覆盖；从臂驱动在实时 Plan ``policy_tcp``（A10PolicyTcpDriver）中执行。
+    // 必须在 cs.init() 之后启动，避免电机池尚未建好时读 actualPos。
     std::thread state_update_thread([&]() {
         while (true)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(33));
 
-            std::vector<double> current_q(13);
-
-            for (int i = 0; i < 12; ++i)
+            // 协议仍为 13 维：前 6 为单臂关节，6..11 在单臂上填 0，[12] 为夹爪。
+            std::vector<double> current_q(13, 0.0);
+            auto& motors = cs.controller().motorPool();
+            const aris::Size n_motors = motors.size();
+            const aris::Size n_arm = n_motors < 6 ? n_motors : static_cast<aris::Size>(6);
+            for (aris::Size i = 0; i < n_arm; ++i)
             {
-                current_q[i] = cs.controller().motorPool()[i].actualPos();
+                current_q[i] = motors[i].actualPos();
             }
             current_q[12] = a10_tcp::g_vr_grip_actual_mm.load(std::memory_order_acquire);
 
@@ -122,47 +127,67 @@ int main(int argc, char *argv[]){
     });
     state_update_thread.detach();
 
-
-    cs.init();
-
     // 修改末端杆件位姿,需要重写xml
    {
-       auto& model = dynamic_cast<aris::dynamic::Model&>(dynamic_cast<aris::dynamic::MultiModel&>(cs.model()).subModels()[0]);
-        double input_pos[7]{0,0,0,0,0,0,0};
+       auto& multimodel = dynamic_cast<aris::dynamic::MultiModel&>(cs.model());
+       if (multimodel.subModels().empty())
+       {
+           std::cerr << "startup: no submodel in MultiModel" << std::endl;
+       }
+       else
+       {
+       auto& model = dynamic_cast<aris::dynamic::Model&>(multimodel.subModels()[0]);
+        double input_pos[6]{0,0,0,0,0,0};
         model.setInputPos(input_pos);
         model.forwardKinematics();
 
-       if (model.name() == "PumaModel" && model.findPart("EE")->geometryPool().size())
+       if (model.name() == "PumaModel")
        {
-            auto pm = *model.findPart("EE")->pm();
-            auto& geo = dynamic_cast<aris::dynamic::FileGeometry&>(model.findPart("EE")->geometryPool()[0]);
+            auto* ee = model.findPart("EE");
+            if (ee && ee->geometryPool().size())
+            {
+            auto pm = *ee->pm();
+            auto& geo = dynamic_cast<aris::dynamic::FileGeometry&>(ee->geometryPool()[0]);
             std::string path = geo.filePath();
-            model.findPart("EE")->geometryPool().clear();
-            model.findPart("EE")->geometryPool().add<aris::dynamic::FileGeometry>(path,pm);
+            ee->geometryPool().clear();
+            ee->geometryPool().add<aris::dynamic::FileGeometry>(path,pm);
+            }
        }
-        else if (model.name() == "UrModel" && model.findPart("L6")->geometryPool().size())
+        else if (model.name() == "UrModel")
         {
-            auto pm = *model.findPart("L6")->pm();
-            auto& geo = dynamic_cast<aris::dynamic::FileGeometry&>(model.findPart("L6")->geometryPool()[0]);
+            auto* l6 = model.findPart("L6");
+            if (l6 && l6->geometryPool().size())
+            {
+            auto pm = *l6->pm();
+            auto& geo = dynamic_cast<aris::dynamic::FileGeometry&>(l6->geometryPool()[0]);
             std::string path = geo.filePath();
-            model.findPart("L6")->geometryPool().clear();
-            model.findPart("L6")->geometryPool().add<aris::dynamic::FileGeometry>(path,pm);
+            l6->geometryPool().clear();
+            l6->geometryPool().add<aris::dynamic::FileGeometry>(path,pm);
+            }
         }
-        else if (model.name() == "ScaraModel" && model.findPart("L4")->geometryPool().size())
+        else if (model.name() == "ScaraModel")
         {
-            auto pm = *model.findPart("L4")->pm();
-            auto& geo = dynamic_cast<aris::dynamic::FileGeometry&>(model.findPart("L4")->geometryPool()[0]);
+            auto* l4 = model.findPart("L4");
+            if (l4 && l4->geometryPool().size())
+            {
+            auto pm = *l4->pm();
+            auto& geo = dynamic_cast<aris::dynamic::FileGeometry&>(l4->geometryPool()[0]);
             std::string path = geo.filePath();
-            model.findPart("L4")->geometryPool().clear();
-            model.findPart("L4")->geometryPool().add<aris::dynamic::FileGeometry>(path,pm);
-
+            l4->geometryPool().clear();
+            l4->geometryPool().add<aris::dynamic::FileGeometry>(path,pm);
+            }
         }
         else if (model.name() == "DeltaModel")
         {
 
         }
         else{}
-        kaanhbot::utility::saveCs();
+        try {
+            kaanhbot::utility::saveCs();
+        } catch (const std::exception& e) {
+            std::cerr << "startup: saveCs skipped (" << e.what() << ")" << std::endl;
+        }
+       }
    }
 	// 重载Aris log接口
 	aris::core::setLogMethod([](aris::core::LogData data)->void {

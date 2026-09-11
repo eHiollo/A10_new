@@ -1,9 +1,9 @@
 #include "movel.hpp"
+#include "robot.hpp"
 #include <cmath>
 #include <iostream>
 
 using namespace std;
-const double PI = 3.141592653589793;
 
 namespace my_cmd
 {   
@@ -50,7 +50,11 @@ namespace my_cmd
     }
 
 	auto MoveLL::executeRT()->int
-	{   
+	{
+		if (!robot::require_dual_arm(*this, "movell"))
+		{
+			return 0;
+		}
 		// aris中所有初始化的模型（xml中定义）都存储在modelBase()中，ModelBase是所有模型的基类，有一些针对具体模型的操作无法直接对ModelBase使用，因此需要进行类型转换
 		// 首先将modelBase转换为MultiModel类型，MultiModel是一个包含多个子模型的模型类
 		// 可以直接对MultiModel进行正逆运动学等操作

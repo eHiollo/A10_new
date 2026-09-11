@@ -1,4 +1,5 @@
 #include <aris.hpp>
+#include <cstddef>
 
 #include "curve.hpp"
 #include "kaanh/general/macro.hpp"
@@ -321,10 +322,37 @@ namespace robot
         aris::core::ImpPtr<Imp> imp_;
     };
 
-
-
-
-
+    inline auto submodel_count(aris::plan::Plan& p) -> std::size_t
+    {
+        return dynamic_cast<aris::dynamic::MultiModel&>(p.modelBase()[0]).subModels().size();
+    }
+    inline auto motor_count(aris::plan::Plan& p) -> aris::Size
+    {
+        return p.controller()->motorPool().size();
+    }
+    inline auto axis_count(aris::plan::Plan& p) -> int
+    {
+        const auto n = motor_count(p);
+        return static_cast<int>(n < 6 ? n : static_cast<aris::Size>(6));
+    }
+    inline auto require_dual_arm(aris::plan::Plan& p, const char* cmd) -> bool
+    {
+        if (submodel_count(p) >= 2 && motor_count(p) >= 12)
+        {
+            return true;
+        }
+        p.mout() << cmd << ": skipped on single-arm robot" << std::endl;
+        return false;
+    }
+    inline auto force_slave_ok(aris::plan::Plan& p, int arm_id) -> bool
+    {
+        if (p.ecMaster() == nullptr)
+        {
+            return false;
+        }
+        const aris::Size idx = static_cast<aris::Size>(8 + 7 * arm_id);
+        return idx < p.ecMaster()->slavePool().size();
+    }
 }
 
 

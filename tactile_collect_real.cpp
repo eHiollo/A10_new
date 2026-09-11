@@ -694,6 +694,11 @@ namespace tactile_collect_real
         imp_->m_ = int32Param("model");
 
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
+        if (dualArm.subModels().size() < 2 || controller()->motorPool().size() < 12)
+        {
+            mout() << "m_tdc: skipped on single-arm robot" << std::endl;
+            return 0;
+        }
         auto& arm1 = dualArm.subModels().at(0);
         auto& arm2 = dualArm.subModels().at(1);
         auto& model_a1 = dynamic_cast<aris::dynamic::Model&>(arm1);

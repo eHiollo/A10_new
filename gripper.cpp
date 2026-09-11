@@ -10,7 +10,6 @@
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
-#include <sys/ioctl.h>
 #include <sys/select.h>
 #include <termios.h>
 #include <unistd.h>
@@ -171,7 +170,8 @@ std::optional<std::vector<uint8_t>> SerialPort::readExact(size_t n, int timeout_
 BusServo::BusServo(const std::string& port, int baudrate, int timeout_ms, bool verbose)
     : verbose_(verbose) {
   if (!serial_.open(port, baudrate, timeout_ms)) {
-    throw std::runtime_error("Failed to open serial port: " + port);
+    throw std::runtime_error(
+        "Failed to open serial port: " + port + ": " + std::strerror(errno));
   }
   init_calibration_();
 }

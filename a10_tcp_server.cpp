@@ -349,19 +349,17 @@ void A10TcpServer::send_leader_state(int client_sock)
         current_q = robot_q_;
     }
     
-    if (current_q.empty())
+    if (current_q.size() < 13)
     {
-        current_q.resize(12, 0.0);
+        current_q.resize(13, 0.0);
     }
 
-    // Only send the first 6 joints
-    size_t send_count = 6;
-
+    // 双臂时 6..11 是主臂；单臂没有第二臂，发 0。
     std::string payload = "{\"q\": [";
-    for (size_t i = 0; i < send_count; ++i)
+    for (size_t i = 0; i < 6; ++i)
     {
         if (i) payload += ", ";
-        payload += std::to_string(current_q[i+6]);
+        payload += std::to_string(current_q[i + 6]);
     }
     payload += "]}\n";
     
@@ -386,9 +384,9 @@ void A10TcpServer::send_follower_state(int client_sock)
         current_q = robot_q_;
     }
     
-    if (current_q.size() < 12)
+    if (current_q.size() < 13)
     {
-        current_q.resize(12, 0.0);
+        current_q.resize(13, 0.0);
     }
 
     //发送七维数据出去

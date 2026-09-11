@@ -45,6 +45,10 @@ namespace robot
         }
     auto ModelSetPos::executeRT()->int
         {
+		if (!require_dual_arm(*this, "m_set"))
+		{
+			return 0;
+		}
 		//test for get force data
 		imp_->m_ = int32Param("model");
 		GravComp gc;
@@ -326,23 +330,23 @@ namespace robot
         
         //dual transform modelbase into multimodel
 		auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
-		//at(0) -> Arm1 -> white
 		auto& arm1 = dualArm.subModels().at(0);
-		//at(1) -> Arm2 -> blue
-		auto& arm2 = dualArm.subModels().at(1);
-
-		//transform to model
 		auto& model_a1 = dynamic_cast<aris::dynamic::Model&>(arm1);
-		auto& model_a2 = dynamic_cast<aris::dynamic::Model&>(arm2);
-
-		//End Effector
 		auto& eeA1 = dynamic_cast<aris::dynamic::GeneralMotion&>(model_a1.generalMotionPool().at(0));
-		auto& eeA2 = dynamic_cast<aris::dynamic::GeneralMotion&>(model_a2.generalMotionPool().at(0));
+		const bool dual = submodel_count(*this) >= 2;
+		aris::dynamic::Model* model_a2 = nullptr;
+		aris::dynamic::GeneralMotion* eeA2 = nullptr;
+		if (dual)
+		{
+			model_a2 = &dynamic_cast<aris::dynamic::Model&>(dualArm.subModels().at(1));
+			eeA2 = &dynamic_cast<aris::dynamic::GeneralMotion&>(model_a2->generalMotionPool().at(0));
+		}
 
         double eePos[12] = { 0 };
 
         static double move = 0.0001;
         static double tolerance = 0.00009;
+		(void)tolerance;
 
         GravComp gc;
 
@@ -353,7 +357,7 @@ namespace robot
         //让主臂和从一样
         const double kDeg = PI / 180.0;
         static const double k_init_preset_0[12] = {
-            -14 * kDeg, -24 * kDeg, 139 * kDeg, -77 * kDeg, -76 * kDeg, -8 * kDeg,
+            -117.127 * kDeg, -46.664 * kDeg, 136.691 * kDeg, -37.318 * kDeg, -70.145 * kDeg, -13.986 * kDeg,
             0, 0, 5 * PI / 6, -7 * PI / 12, -PI / 2, 0
         };
         static const double k_init_preset_1[12] = {
@@ -381,6 +385,10 @@ namespace robot
 		{
 
 			int raw_force[6]{ 0 };
+			if (!force_slave_ok(*this, m_))
+			{
+				return;
+			}
 
 			for (std::size_t i = 0; i < 6; ++i)
 			{
@@ -437,8 +445,14 @@ namespace robot
             mout() << "m_init: preset=" << imp_->preset_index << std::endl;
 
             getForceData(imp_->arm1_init_force, 0, imp_->init);
-            getForceData(imp_->arm2_init_force, 1, imp_->init);
-            master()->logFileRawName(std::string("/home/kaanh/Desktop/kaanhbin/force_comp_data/forceComp_" + aris::core::logFileTimeFormat(std::chrono::system_clock::now())).c_str());
+            if (dual)
+            {
+                getForceData(imp_->arm2_init_force, 1, imp_->init);
+            }
+            if (force_slave_ok(*this, 0))
+            {
+                master()->logFileRawName("log/forceComp_");
+            }
             imp_->init = true;
         }
 
@@ -470,10 +484,19 @@ namespace robot
         double arm2_raw_force[6]{0};
 
         eeA1.getMpm(current_arm1_pm);
-		eeA2.getMpm(current_arm2_pm);
+		if (eeA2 != nullptr)
+		{
+			eeA2->getMpm(current_arm2_pm);
+		}
 
-		getForceData(current_arm1_force, 0, imp_->init);
-        getForceData(current_arm2_force, 1, imp_->init);
+		if (force_slave_ok(*this, 0))
+		{
+			getForceData(current_arm1_force, 0, imp_->init);
+		}
+        if (dual && force_slave_ok(*this, 1))
+        {
+            getForceData(current_arm2_force, 1, imp_->init);
+        }
 		
         gc.getCompFT(current_arm1_pm, imp_->arm1_l_vector, imp_->arm1_p_vector, arm1_comp_force);
         gc.getCompFT(current_arm2_pm, imp_->arm2_l_vector, imp_->arm2_p_vector, arm2_comp_force);
@@ -510,17 +533,26 @@ namespace robot
         }
 
 
+        const int n_axis = axis_count(*this);
         double current_angle[12] = { 0 };
 
-        for (int i = 0; i < 12; i++)
+        for (int i = 0; i < n_axis; i++)
         {
             current_angle[i] = controller()->motorPool()[i].targetPos();
+        }
+        if (dual)
+        {
+            for (int i = 6; i < 12 && static_cast<aris::Size>(i) < motor_count(*this); i++)
+            {
+                current_angle[i] = controller()->motorPool()[i].targetPos();
+            }
         }
 
 
         auto motorsPositionCheck = [=]()
         {
-            for(int i = 0; i < 12; i++)
+            const int n_check = dual ? 12 : n_axis;
+            for(int i = 0; i < n_check; i++)
             {
                 if(std::fabs(current_angle[i]-init_pos[i])>=move)
                 {
@@ -533,8 +565,13 @@ namespace robot
 
 
 
-        for (int i = 0; i < 12; i++)
+        const int n_move = dual ? 12 : n_axis;
+        for (int i = 0; i < n_move; i++)
         {
+            if (static_cast<aris::Size>(i) >= motor_count(*this))
+            {
+                break;
+            }
             if (current_angle[i] <= init_pos[i] - move)
             {
                 controller()->motorPool()[i].setTargetPos(current_angle[i] + move);
@@ -628,6 +665,10 @@ namespace robot
 	}
 	auto ModelGet::executeRT() -> int
 	{
+        if (!require_dual_arm(*this, "m_get"))
+        {
+            return 0;
+        }
 		//test for get force data
         imp_->m_ = int32Param("model");
         GravComp gc;
@@ -876,17 +917,16 @@ namespace robot
 		double input_angle[12]{};
 		double ee_pos[12]{};
 
-		if (count() == 1)
-		{
+        if (count() == 1)
+        {
+            double begin_angle[12]{ 0 };
+            const int n_axis = axis_count(*this);
+            for (int i = 0; i < n_axis; i++)
+            {
+                begin_angle[i] = controller()->motorPool()[i].targetPos();
+            }
 
-			double begin_angle[12]{ 0 };
-
-			for (int i = 0; i < 12; i++)
-			{
-				begin_angle[i] = controller()->motorPool()[i].targetPos();
-			}
-
-			aris::dynamic::dsp(1, 12, begin_angle);
+            aris::dynamic::dsp(1, n_axis, begin_angle);
 
 			//this->master()->logFileRawName("move");
 			mout() << "read init angle" << std::endl;
@@ -929,7 +969,8 @@ namespace robot
 
 		modelBase()->getInputPos(input_angle);
 
-		for (int i = 0; i < 12; i++)
+		const int n_axis = axis_count(*this);
+		for (int i = 0; i < n_axis; i++)
 		{
 			controller()->motorPool()[i].setTargetPos(input_angle[i]);
 		}
@@ -1048,6 +1089,10 @@ namespace robot
 	}
     auto ModelTest::executeRT()->int
 	{
+        if (!require_dual_arm(*this, "m_t"))
+        {
+            return 0;
+        }
 
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
@@ -1297,6 +1342,10 @@ namespace robot
 	}
 	auto ModelComP::executeRT()->int
 	{
+        if (!require_dual_arm(*this, "m_comp"))
+        {
+            return 0;
+        }
 
         GravComp gc;
 		static double tolerance = 0.0001;
@@ -2032,6 +2081,10 @@ namespace robot
 	}
 	auto ForceAlign::executeRT()->int
 	{
+        if (!require_dual_arm(*this, "m_fa"))
+        {
+            return 0;
+        }
 
 		static double tolerance = 0.0001;
 		static double init_angle[12] =
@@ -2510,6 +2563,10 @@ namespace robot
 	}
 	auto ForceKeep::executeRT() -> int
 	{
+        if (!require_dual_arm(*this, "m_fk"))
+        {
+            return 0;
+        }
 		//dual transform modelbase into multimodel
 		auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
 		//at(0) -> Arm1 -> white
@@ -3165,6 +3222,10 @@ namespace robot
 	}
 	auto ForceDrag::executeRT() -> int
 	{
+        if (!require_dual_arm(*this, "m_fd"))
+        {
+            return 0;
+        }
 		//dual transform modelbase into multimodel
 		auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
 		//at(0) -> Arm1 -> white
@@ -4059,6 +4120,10 @@ namespace robot
     }
     auto Demo::executeRT() -> int
     {
+        if (!require_dual_arm(*this, "demo"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white
@@ -4878,6 +4943,10 @@ namespace robot
     }
     auto PegOutHole::executeRT() -> int
     {
+        if (!require_dual_arm(*this, "m_po"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white
@@ -5333,6 +5402,10 @@ namespace robot
     }
     auto Search::executeRT() -> int
     {
+        if (!require_dual_arm(*this, "m_search"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white
@@ -5942,6 +6015,10 @@ namespace robot
     }
     auto Arm2PegInHole::executeRT() -> int
     {
+        if (!require_dual_arm(*this, "a2ph"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white
@@ -7059,6 +7136,10 @@ namespace robot
     }
     auto PlateAllignData::executeRT() -> int
     {
+        if (!require_dual_arm(*this, "m_pad"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white
@@ -7929,6 +8010,10 @@ namespace robot
     }
     auto PlateAllignTest::executeRT() -> int
     {
+        if (!require_dual_arm(*this, "m_pat"))
+        {
+            return 0;
+        }
         //dual transform modelbase into multimodel
         auto& dualArm = dynamic_cast<aris::dynamic::MultiModel&>(modelBase()[0]);
         //at(0) -> Arm1 -> white
@@ -8770,15 +8855,10 @@ auto PressDown::executeRT() -> int
 
 	// dual transform modelbase into multimodel
 	auto &dualArm = dynamic_cast<aris::dynamic::MultiModel &>(modelBase()[0]);
-	// at(0) -> Arm1 ->white
 	auto &arm1 = dualArm.subModels().at(0);
-	// at(1) -> Arm2 ->blue
-	auto &arm2 = dualArm.subModels().at(1);
-	// transform to model
 	auto &model_a1 = dynamic_cast<aris::dynamic::Model &>(arm1);
-	auto &model_a2 = dynamic_cast<aris::dynamic::Model &>(arm2);
 	auto &eeA1 = dynamic_cast<aris::dynamic::GeneralMotion &>(model_a1.generalMotionPool().at(0));
-	auto &eeA2 = dynamic_cast<aris::dynamic::GeneralMotion &>(model_a2.generalMotionPool().at(0));
+	(void)eeA1;
 	// =====================================================================================
 
 	// [MOD] 固定选择 m=0（Arm1）
@@ -8842,7 +8922,8 @@ auto PressDown::executeRT() -> int
 
 	double q[6]{0};
 	model.getInputPos(q);
-	for (int i = 0; i < 6; ++i)
+	const int n_axis = axis_count(*this);
+	for (int i = 0; i < n_axis; ++i)
 		controller()->motorPool()[motor_start_idx + i].setTargetPos(q[i]);
 
 	// 低频打印（每1秒一次）
@@ -8913,6 +8994,10 @@ auto PressDown::executeRT() -> int
 
         if (imp_->model_id < 0 || imp_->model_id > 1) {
             mout() << "traj_run: model must be 0 or 1" << std::endl;
+            return 0;
+        }
+        if (static_cast<std::size_t>(imp_->model_id) >= submodel_count(*this)) {
+            mout() << "traj_run: model " << imp_->model_id << " not in this robot" << std::endl;
             return 0;
         }
 
@@ -9074,6 +9159,10 @@ auto PressDown::executeRT() -> int
 
         if (imp_->model_id < 0 || imp_->model_id > 1) {
             mout() << "ptr: model must be 0 or 1" << std::endl;
+            return 0;
+        }
+        if (static_cast<std::size_t>(imp_->model_id) >= submodel_count(*this)) {
+            mout() << "ptr: model " << imp_->model_id << " not in this robot" << std::endl;
             return 0;
         }
 

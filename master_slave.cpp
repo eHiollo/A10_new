@@ -67,8 +67,12 @@ namespace master_slave
 
     auto MasterSlave::executeRT() -> int
     {
-        // dual transform modelbase into multimodel
         auto &dualArm = dynamic_cast<aris::dynamic::MultiModel &>(modelBase()[0]);
+        if (dualArm.subModels().size() < 2 || controller()->motorPool().size() < 12)
+        {
+            mout() << "master_slave: skipped on single-arm robot" << std::endl;
+            return 0;
+        }
         auto &arm1 = dualArm.subModels().at(0); // Leader
         auto &arm2 = dualArm.subModels().at(1); // Follower
 

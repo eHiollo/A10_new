@@ -25,6 +25,8 @@ extern std::atomic<double> g_vr_grip_actual_mm;
 void set_vr_grip_cmd(double cmd);
 void clear_vr_grip_cmd();
 void sync_vr_grip_target_from_actual(double mm);
+/// 实时安全：请求夹爪绝对开度（mm）。由 USB 服务线程执行，不在 RT 里访问串口。
+void request_gripper_position_mm(double mm);
 
 /// 非 RT 线程：积分 ``g_vr_grip_cmd`` 并调用 ``BusServo::set_gripper_position``。
 void run_gripper_service_loop(BusServo* gripper);
