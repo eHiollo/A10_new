@@ -1685,6 +1685,9 @@
             <A10VrCliStop name="plan">
                 <Command __prop_name__="command" name="stop_teleop"/>
             </A10VrCliStop>
+            <A10VrCliInit name="plan">
+                <Command __prop_name__="command" name="reset"/>
+            </A10VrCliInit>
             <A10GripperOpen name="plan">
                 <Command __prop_name__="command" name="g_open"/>
             </A10GripperOpen>

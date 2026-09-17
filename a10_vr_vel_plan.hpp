@@ -10,6 +10,7 @@ namespace a10_tcp
 {
 /// VR P 速度遥操作：``SET_EE_DELTA`` 累加 ``target_pm``；``v = Kp×(target−actual)`` 限幅 + slew → IK。
 /// idle 时 ``target`` 缓慢贴回实测位姿。夹爪同 ``vr``。
+/// ``reset`` 不退出本驱动，内部关节回到初始位姿后重统一位姿跟踪。
 class A10VrVelDriver : public aris::core::CloneObject<A10VrVelDriver, aris::plan::Plan>
 {
 public:

@@ -10,6 +10,7 @@
 #include <rtb.hpp>
 
 #include "a10_gripper_bridge.hpp"
+#include "a10_init_presets.hpp"
 #include "a10_policy_tcp_plan.hpp"
 #include "a10_tcp_server.hpp"
 #include "a10_vr_plan.hpp"
@@ -325,8 +326,11 @@ struct A10VrVelDriver::Imp
 
     std::uint64_t consumed_ee_delta_seq_{0};
     std::int64_t last_packet_count_{0};
+    std::int64_t homing_start_count_{0};
     bool inited_{false};
     bool idle_coast_{false};
+    bool homing_{false};
+    int homing_preset_{0};
 
     double max_lin_vel_{0.12};
     double max_ang_vel_{0.4};
@@ -362,16 +366,106 @@ struct A10VrVelDriver::Imp
         w_cmd_tool[1] = 0.0;
         w_cmd_tool[2] = 0.0;
     }
+
+    void drain_ee_delta()
+    {
+        if (g_tcp_server == nullptr)
+        {
+            return;
+        }
+        std::vector<double> delta;
+        std::uint64_t seq = 0;
+        if (g_tcp_server->fetch_ee_delta_if_updated(delta, seq, consumed_ee_delta_seq_))
+        {
+            consumed_ee_delta_seq_ = seq;
+        }
+    }
+
+    void begin_homing(int preset, std::int64_t now, aris::plan::Plan& plan)
+    {
+        homing_ = true;
+        homing_preset_ = a10_init::clamp_preset(preset);
+        homing_start_count_ = now;
+        idle_coast_ = false;
+        zero_motion_state();
+        clear_vr_grip_cmd();
+        drain_ee_delta();
+        plan.mout() << "vr_vel: homing to preset=" << homing_preset_ << std::endl;
+    }
+
+    bool step_joints_toward_preset()
+    {
+        const double* init_pos = a10_init::preset_joints(homing_preset_);
+        bool arrived = true;
+        for (int i = 0; i < k_joint_num; ++i)
+        {
+            const double tgt = init_pos[i];
+            double& cur = output_joints[i];
+            const double err = tgt - cur;
+            if (std::fabs(err) < a10_init::k_home_tol_rad)
+            {
+                cur = tgt;
+                continue;
+            }
+            arrived = false;
+            if (err > 0.0)
+            {
+                cur = std::min(cur + a10_init::k_home_step_rad, tgt);
+            }
+            else
+            {
+                cur = std::max(cur - a10_init::k_home_step_rad, tgt);
+            }
+        }
+        return arrived;
+    }
+
+    void reacquire_from_command(aris::plan::Plan& plan, aris::dynamic::Model& arm, aris::dynamic::GeneralMotion& ee)
+    {
+        arm.setInputPos(output_joints);
+        if (arm.forwardKinematics())
+        {
+            std::memcpy(output_joints, current_joints, sizeof(output_joints));
+            arm.setInputPos(output_joints);
+            if (arm.forwardKinematics())
+            {
+                plan.mout() << "vr_vel: reacquire FK fail" << std::endl;
+                zero_motion_state();
+                idle_coast_ = false;
+                inited_ = true;
+                homing_ = false;
+                return;
+            }
+        }
+        ee.updP();
+        ee.getMpm(target_pm);
+        std::memcpy(command_pm, target_pm, sizeof(command_pm));
+        std::memcpy(ik_joints, output_joints, sizeof(ik_joints));
+        zero_motion_state();
+        idle_coast_ = false;
+        last_packet_count_ = plan.count();
+        if (g_tcp_server != nullptr)
+        {
+            consumed_ee_delta_seq_ = g_tcp_server->ee_delta_seq();
+        }
+        sync_vr_grip_target_from_actual(g_vr_grip_actual_mm.load(std::memory_order_acquire));
+        inited_ = true;
+        homing_ = false;
+    }
 };
 
 auto A10VrVelDriver::prepareNrt() -> void
 {
     imp_->inited_ = false;
     imp_->idle_coast_ = false;
+    imp_->homing_ = false;
+    imp_->homing_preset_ = 0;
+    imp_->homing_start_count_ = 0;
     imp_->consumed_ee_delta_seq_ = 0;
     imp_->last_packet_count_ = 0;
     imp_->zero_motion_state();
     g_a10_vr_stop_requested.store(false, std::memory_order_release);
+    g_a10_vr_init_requested.store(false, std::memory_order_release);
 
     for (auto& m : motorOptions())
     {
@@ -385,7 +479,9 @@ auto A10VrVelDriver::executeRT() -> int
     if (g_a10_policy_tcp_stop_requested.exchange(false, std::memory_order_acq_rel))
     {
         g_a10_vr_stop_requested.store(false, std::memory_order_release);
+        g_a10_vr_init_requested.store(false, std::memory_order_release);
         imp_->inited_ = false;
+        imp_->homing_ = false;
         imp_->zero_motion_state();
         clear_vr_grip_cmd();
         mout() << "vr_vel: stop by policy stop flag" << std::endl;
@@ -395,7 +491,9 @@ auto A10VrVelDriver::executeRT() -> int
     if (g_a10_vr_stop_requested.load(std::memory_order_acquire))
     {
         g_a10_vr_stop_requested.store(false, std::memory_order_release);
+        g_a10_vr_init_requested.store(false, std::memory_order_release);
         imp_->inited_ = false;
+        imp_->homing_ = false;
         imp_->zero_motion_state();
         clear_vr_grip_cmd();
         mout() << "vr_vel: stop by teleop stop flag" << std::endl;
@@ -416,6 +514,11 @@ auto A10VrVelDriver::executeRT() -> int
         }
         return 0;
     }
+    for (int i = 0; i < k_joint_num; ++i)
+    {
+        imp_->current_joints[i] = motors[k_motor_base + i].actualPos();
+    }
+
     auto& arm = arm_model(*this);
     auto& ee = ee_motion(*this);
 
@@ -439,19 +542,19 @@ auto A10VrVelDriver::executeRT() -> int
         }
     }
 
-    for (int i = 0; i < k_joint_num; ++i)
-    {
-        imp_->current_joints[i] = motors[k_motor_base + i].actualPos();
-    }
-
     double T_base_to_ee[16]{};
-    arm.setInputPos(imp_->current_joints);
-    if (arm.forwardKinematics())
+    const bool want_home =
+        imp_->homing_ || g_a10_vr_init_requested.load(std::memory_order_acquire);
+    if (!want_home || !imp_->inited_)
     {
-        return count();
+        arm.setInputPos(imp_->current_joints);
+        if (arm.forwardKinematics())
+        {
+            return count();
+        }
+        ee.updP();
+        ee.getMpm(T_base_to_ee);
     }
-    ee.updP();
-    ee.getMpm(T_base_to_ee);
 
     if (!imp_->inited_)
     {
@@ -464,7 +567,44 @@ auto A10VrVelDriver::executeRT() -> int
         sync_vr_grip_target_from_actual(g_vr_grip_actual_mm.load(std::memory_order_acquire));
         imp_->inited_ = true;
         mout() << "vr_vel: init ok (P velocity, target+=delta, tool-frame)" << std::endl;
-        return 1;
+        if (!g_a10_vr_init_requested.load(std::memory_order_acquire))
+        {
+            return 1;
+        }
+    }
+
+    if (g_a10_vr_init_requested.exchange(false, std::memory_order_acq_rel))
+    {
+        imp_->begin_homing(0, count(), *this);
+    }
+
+    if (imp_->homing_)
+    {
+        imp_->drain_ee_delta();
+        clear_vr_grip_cmd();
+        const bool arrived = imp_->step_joints_toward_preset();
+        const bool timed_out =
+            (count() - imp_->homing_start_count_) >= a10_init::k_home_timeout_cycles;
+        if (arrived || timed_out)
+        {
+            if (timed_out && !arrived)
+            {
+                mout() << "vr_vel: homing timeout, reacquire at current command" << std::endl;
+            }
+            else
+            {
+                mout() << "vr_vel: homing done, preset=" << imp_->homing_preset_ << std::endl;
+            }
+            imp_->reacquire_from_command(*this, arm, ee);
+        }
+        else if (count() % 1000 == 0)
+        {
+            mout() << "vr_vel homing: q=" << imp_->output_joints[0] << "\t" << imp_->output_joints[1]
+                   << "\t" << imp_->output_joints[2] << "\t" << imp_->output_joints[3] << "\t"
+                   << imp_->output_joints[4] << "\t" << imp_->output_joints[5] << std::endl;
+        }
+        imp_->apply_joints_to_motors(*this);
+        return count();
     }
 
     const double elapsed_since_packet =
