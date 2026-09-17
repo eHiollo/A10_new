@@ -5,6 +5,7 @@
 #include <ostream>
 #include <unordered_map>
 #include <vector>
+#include "a10_init_presets.hpp"
 #include "a10_tcp_server.hpp"
 #include "gripper.hpp"
 
@@ -352,33 +353,6 @@ namespace robot
         // { 0, 0, 5 * PI / 6, -5 * PI / 6, -PI / 2, 0,
         // 0, 0, -2 * PI / 3, PI / 6, PI / 2, 0 };
 
-        //让主臂和从一样
-        const double kDeg = PI / 180.0;
-        static const double k_init_preset_0[12] = {
-            -14 * kDeg, -24 * kDeg, 139 * kDeg, -77 * kDeg, -76 * kDeg, -8 * kDeg,
-            0, 0, -5 * PI / 6, 5 * PI / 6, PI / 2, 0
-        };
-        static const double k_init_preset_1[12] = {
-            -19.5 * kDeg, -19.3 * kDeg, 126.5 * kDeg, -61 * kDeg, -70 * kDeg, -9 * kDeg,
-            0, 0, -5 * PI / 6, 5 * PI / 6, PI / 2, 0
-        };
-        static const double k_init_preset_2[12] = {
-            -31 * kDeg, -23.5 * kDeg, 123.5 * kDeg, -51.6 * kDeg, -62.4 * kDeg, -22 * kDeg,
-            0, 0, -5 * PI / 6, 5 * PI / 6, PI / 2, 0
-        };
-        static const double k_init_preset_3[12] = {
-            -40 * kDeg, -8.8 * kDeg, 106.5 * kDeg, -32.8 * kDeg, -54.3 * kDeg, -33 * kDeg,
-            0, 0, -5 * PI / 6, 5 * PI / 6, PI / 2, 0
-        };
-        static const double k_init_preset_4[12] = {
-            -11.7 * kDeg, -7.7 * kDeg, 95.6 * kDeg, -15.8 * kDeg, -86.3 * kDeg, -2.5 * kDeg,
-            0, 0, -5 * PI / 6, 5 * PI / 6, PI / 2, 0
-        };
-        static const double k_init_preset_5[12] = {
-            -7.8 * kDeg, 1.6 * kDeg, 89.7 * kDeg, -18.6 * kDeg, -88.7 * kDeg, 0.9 * kDeg,
-            0, 0, -5 * PI / 6, 5 * PI / 6, PI / 2, 0
-        };
-
         auto getForceData = [&](double* data_, int m_, bool init_)
 		{
 
@@ -425,10 +399,6 @@ namespace robot
 
 		};
 
-        static const double *const k_init_preset_table[6] = {
-            k_init_preset_0, k_init_preset_1, k_init_preset_2, k_init_preset_3,
-            k_init_preset_4, k_init_preset_5};
-
         if (count() == 1) {
             int p = int32Param("preset");
             if (p < 0 || p > 5) {
@@ -455,7 +425,7 @@ namespace robot
 
         double init_pos[12]{ 0 };
         {
-            const double *const preset = k_init_preset_table[imp_->preset_index];
+            const double *const preset = a10_init::preset_joints(imp_->preset_index);
             for (int i = 0; i < 6; ++i)
             {
                 init_pos[i] = preset[i];

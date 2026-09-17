@@ -95,6 +95,7 @@ auto creatPlanRoot()->std::unique_ptr<aris::plan::PlanRoot>
     plan_root->planPool().add<a10_tcp::A10VrDriver>();
     plan_root->planPool().add<a10_tcp::A10VrVelDriver>();
     plan_root->planPool().add<a10_tcp::A10VrCliStop>();
+    plan_root->planPool().add<a10_tcp::A10VrCliInit>();
 
     return plan_root;
 }

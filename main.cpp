@@ -15,10 +15,12 @@
 #include "plan.hpp"
 #include "a10_gripper_bridge.hpp"
 #include "a10_tcp_server.hpp"
+#include "a10_vr_plan.hpp"
 #include "gripper.hpp"
 
 #include "robot.hpp"
 #include "assemcomd.hpp"
+#include "kaanh/middleware/shell.hpp"
 #include <memory>
 #define __S(x) #x
 #define _S(x) __S(x)
@@ -63,6 +65,30 @@ int main(int argc, char *argv[]){
 	});
 
 	aris::core::fromXmlFile(cs, path);
+
+    try
+    {
+        auto& shell = kaanh::middleware::Shell::instanceInCs();
+        auto& pool = shell.modulePool();
+        bool has = false;
+        for (aris::Size i = 0; i < pool.size(); ++i)
+        {
+            if (pool[i].name() == "VrReset")
+            {
+                has = true;
+                break;
+            }
+        }
+        if (!has)
+        {
+            pool.add<a10_tcp::A10VrResetModule>();
+            std::cout << "VrReset: intercept reset in Shell (not Plan queue)" << std::endl;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "VrReset install failed: " << e.what() << std::endl;
+    }
     
     //建立TCP服务，与lerobot通信
     static A10TcpServer tcp_server;
