@@ -1,5 +1,6 @@
 #include "plan.hpp"
 
+#include "a10_gripper_plan.hpp"
 #include "a10_policy_tcp_plan.hpp"
 #include "a10_vr_plan.hpp"
 #include "a10_vr_vel_plan.hpp"
@@ -95,6 +96,10 @@ auto creatPlanRoot()->std::unique_ptr<aris::plan::PlanRoot>
     plan_root->planPool().add<a10_tcp::A10VrDriver>();
     plan_root->planPool().add<a10_tcp::A10VrVelDriver>();
     plan_root->planPool().add<a10_tcp::A10VrCliStop>();
+    plan_root->planPool().add<a10_tcp::A10GripperOpen>();
+    plan_root->planPool().add<a10_tcp::A10GripperClose>();
+    plan_root->planPool().add<a10_tcp::A10GripperMove>();
+    plan_root->planPool().add<a10_tcp::A10GripperStatus>();
 
     return plan_root;
 }

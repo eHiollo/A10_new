@@ -1685,6 +1685,22 @@
             <A10VrCliStop name="plan">
                 <Command __prop_name__="command" name="stop_teleop"/>
             </A10VrCliStop>
+            <A10GripperOpen name="plan">
+                <Command __prop_name__="command" name="g_open"/>
+            </A10GripperOpen>
+            <A10GripperClose name="plan">
+                <Command __prop_name__="command" name="g_close"/>
+            </A10GripperClose>
+            <A10GripperMove name="plan">
+                <Command __prop_name__="command" name="g_move">
+                    <GroupParam name="group_param">
+                        <Param name="pos" abbreviation="p" default="50"/>
+                    </GroupParam>
+                </Command>
+            </A10GripperMove>
+            <A10GripperStatus name="plan">
+                <Command __prop_name__="command" name="g_status"/>
+            </A10GripperStatus>
             <PressDown name="plan">
                 <Command __prop_name__="command" name="press_down">
                     <GroupParam name="group_param">

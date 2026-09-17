@@ -45,6 +45,7 @@ set(KAANHBIN_SOURCES
     a10_vr_plan.cpp
     a10_vr_vel_plan.cpp
     a10_gripper_bridge.cpp
+    a10_gripper_plan.cpp
     cmd_ft_unit_test.cpp
     gripper.cpp
     gravcomp.cpp
