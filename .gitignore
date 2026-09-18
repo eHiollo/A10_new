@@ -6,3 +6,4 @@ client/__pycache__/
 client/**/__pycache__/
 client/camera_snaps/
 *.pyc
+kaanh.xml.bak

@@ -21,7 +21,14 @@
 #include "robot.hpp"
 #include "assemcomd.hpp"
 #include "kaanh/middleware/shell.hpp"
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
 #define __S(x) #x
 #define _S(x) __S(x)
 
@@ -33,6 +40,75 @@ auto xmlpath = std::filesystem::absolute(".");	//获取当前工程所在的路�
 auto logpath = std::filesystem::absolute(".");
 const std::string xmlfile = "kaanh.xml";
 const std::string logfolder = "log";
+
+namespace {
+
+/// 文件存在且非空的字节数；否则返回 0
+std::uintmax_t xml_bytes(const std::filesystem::path& p)
+{
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(p, ec);
+    return ec ? 0 : static_cast<std::uintmax_t>(sz);
+}
+
+/// 把 src 复制到 dst，成功且 dst 非空才算成功
+bool copy_xml_over(const std::filesystem::path& src, const std::filesystem::path& dst)
+{
+    if (xml_bytes(src) == 0) return false;
+    std::error_code ec;
+    std::filesystem::copy_file(
+        src, dst, std::filesystem::copy_options::overwrite_existing, ec);
+    return !ec && xml_bytes(dst) > 0;
+}
+
+/// 备份：path -> path.bak（仅在 path 有效时）
+void backup_xml(const std::filesystem::path& path)
+{
+    const auto bak = std::filesystem::path(path.string() + ".bak");
+    if (copy_xml_over(path, bak))
+    {
+        std::cout << "startup: xml backup -> " << bak << std::endl;
+    }
+}
+
+/// 自愈：若 path 缺失或为 0 字节，依次尝试 path.bak、各级父目录的 kaanh.xml 恢复。
+/// 这一步在 fromXmlFile 之前执行，避免残留的空 kaanh.xml 让程序直接中止。
+bool heal_xml(const std::filesystem::path& path)
+{
+    if (xml_bytes(path) > 0) return true;
+
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+
+    std::vector<std::filesystem::path> candidates;
+    candidates.emplace_back(path.string() + ".bak");
+
+    const auto dir = path.parent_path();
+    if (!dir.empty())
+    {
+        for (auto p = dir;; p = p.parent_path())
+        {
+            candidates.emplace_back(p / xmlfile);
+            if (p == p.parent_path()) break;
+        }
+    }
+
+    std::cerr << "startup: kaanh.xml 为空或缺失 (" << path << ")，尝试自愈..." << std::endl;
+    for (const auto& c : candidates)
+    {
+        if (copy_xml_over(c, path))
+        {
+            std::cerr << "startup: kaanh.xml 已从 " << c << " 恢复 ("
+                      << xml_bytes(path) << " 字节)" << std::endl;
+            return true;
+        }
+    }
+
+    std::cerr << "startup: 自愈失败，未找到可用的 kaanh.xml 来源" << std::endl;
+    return false;
+}
+
+}  // namespace
 
 int main(int argc, char *argv[]){
 	xmlpath = xmlpath / xmlfile;
@@ -47,6 +123,11 @@ int main(int argc, char *argv[]){
 	std::cout << "xmlpath:" << xmlpath << std::endl;
 	std::cout << "path:" << path << std::endl;
 	std::cout << "logfolder:" << logp << std::endl;
+
+	// 读取前先自愈：build/bin/kaanh.xml 可能被上一次异常退出清成 0 字节
+	// （saveCs 在写入途中进程崩溃时就会这样），此时直接 fromXmlFile 会以
+	// "XML_ERROR_EMPTY_DOCUMENT" 中止，表现为机器人完全起不来。
+	heal_xml(std::filesystem::path(path));
 
 	// 重载Aris log接口
 	aris::core::setLogMethod([](aris::core::LogData data)->void {
@@ -208,10 +289,43 @@ int main(int argc, char *argv[]){
 
         }
         else{}
+
+        // 注意：saveCs() 写的是相对当前工作目录的 ./kaanh.xml（即 build/bin/kaanh.xml），
+        // 且是"先截断文件、再序列化"的顺序。若序列化过程中进程异常退出（本工程实测在
+        // 退出阶段会出现 "free(): double free detected" 而 abort），文件会被留下成 0 字节，
+        // 下一次启动就会以 XML_ERROR_EMPTY_DOCUMENT 中止。
+        // 因此这里先备份、调用后校验，失败则回滚；配合启动时的 heal_xml() 双保险。
+        const std::filesystem::path cs_xml = std::filesystem::absolute(xmlfile);
+
+        backup_xml(cs_xml);
+
+        std::string save_err;
+        bool save_ok = false;
         try {
             kaanhbot::utility::saveCs();
+            save_ok = xml_bytes(cs_xml) > 0;
+            if (!save_ok) save_err = "saveCs produced an empty kaanh.xml";
         } catch (const std::exception& e) {
-            std::cerr << "startup: saveCs skipped (" << e.what() << ")" << std::endl;
+            save_err = e.what();
+        }
+
+        if (save_ok)
+        {
+            std::cout << "startup: saveCs ok (" << xml_bytes(cs_xml) << " 字节)" << std::endl;
+        }
+        else
+        {
+            const auto bak = std::filesystem::path(cs_xml.string() + ".bak");
+            if (copy_xml_over(bak, cs_xml))
+            {
+                std::cerr << "startup: saveCs 失败 (" << save_err
+                          << ")，kaanh.xml 已从备份回滚" << std::endl;
+            }
+            else
+            {
+                std::cerr << "startup: saveCs 失败 (" << save_err
+                          << ")，备份不可用" << std::endl;
+            }
         }
        }
    }
