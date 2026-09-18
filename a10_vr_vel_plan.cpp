@@ -324,6 +324,8 @@ struct A10VrVelDriver::Imp
     double output_joints[k_joint_num]{};
 
     std::uint64_t consumed_ee_delta_seq_{0};
+    std::uint64_t consumed_ee_anchor_seq_{0};
+    EeAnchorShadow anchor_shadow_;
     std::int64_t last_packet_count_{0};
     bool inited_{false};
     bool idle_coast_{false};
@@ -369,6 +371,8 @@ auto A10VrVelDriver::prepareNrt() -> void
     imp_->inited_ = false;
     imp_->idle_coast_ = false;
     imp_->consumed_ee_delta_seq_ = 0;
+    imp_->consumed_ee_anchor_seq_ = 0;
+    imp_->anchor_shadow_.reset();
     imp_->last_packet_count_ = 0;
     imp_->zero_motion_state();
     g_a10_vr_stop_requested.store(false, std::memory_order_release);
@@ -467,6 +471,29 @@ auto A10VrVelDriver::executeRT() -> int
         return 1;
     }
 
+    EeAnchorCommand anchor_command;
+    std::uint64_t anchor_mailbox_seq = 0;
+    if (g_tcp_server->fetch_ee_anchor_if_updated(
+            anchor_command, anchor_mailbox_seq, imp_->consumed_ee_anchor_seq_))
+    {
+        imp_->consumed_ee_anchor_seq_ = anchor_mailbox_seq;
+        const bool anchor_was_active = imp_->anchor_shadow_.active();
+        const AnchorShadowUpdate update =
+            imp_->anchor_shadow_.update(anchor_command, T_base_to_ee);
+        if (update == AnchorShadowUpdate::anchored)
+        {
+            mout() << "vr_vel A2.2 shadow: anchored session="
+                   << imp_->anchor_shadow_.session_id()
+                   << " anchor=" << imp_->anchor_shadow_.anchor_id()
+                   << " sample=" << imp_->anchor_shadow_.sample_sequence()
+                   << " (diagnostic only)" << std::endl;
+        }
+        else if (update == AnchorShadowUpdate::inactive && anchor_was_active)
+        {
+            mout() << "vr_vel A2.2 shadow: inactive (diagnostic only)" << std::endl;
+        }
+    }
+
     const double elapsed_since_packet =
         static_cast<double>(count() - imp_->last_packet_count_) * k_dt;
 
@@ -528,6 +555,17 @@ auto A10VrVelDriver::executeRT() -> int
         mout() << "vr_vel diag: |e_pos|=" << vec3_norm(e_pos_tool) << "m |e_rot|=" << vec3_norm(e_rot_tool)
                << "rad |v|=" << vec3_norm(imp_->v_cmd_tool) << " |w|=" << vec3_norm(imp_->w_cmd_tool)
                << (imp_->idle_coast_ ? " idle" : "") << std::endl;
+        if (imp_->anchor_shadow_.active())
+        {
+            const auto& robot_anchor = imp_->anchor_shadow_.robot_anchor_pm();
+            const auto& user_target = imp_->anchor_shadow_.user_target_pm();
+            mout() << "vr_vel A2.2 shadow: anchor=" << imp_->anchor_shadow_.anchor_id()
+                   << " sample=" << imp_->anchor_shadow_.sample_sequence()
+                   << " robot_xyz=[" << robot_anchor[3] << "," << robot_anchor[7] << ","
+                   << robot_anchor[11] << "] user_xyz=[" << user_target[3] << ","
+                   << user_target[7] << "," << user_target[11]
+                   << "] diagnostic_only=true" << std::endl;
+        }
     }
 
     arm.setInputPos(imp_->output_joints);

@@ -266,6 +266,7 @@ void A10TcpServer::clear_policy_tcp_targets_nrt()
         target_q_.clear();
     }
     clear_ee_delta_target_nrt();
+    clear_ee_anchor_target_nrt();
 }
 
 void A10TcpServer::clear_ee_delta_target_nrt()
@@ -297,6 +298,29 @@ bool A10TcpServer::fetch_ee_delta_if_updated(
         return false;
     }
     out = target_ee_delta_;
+    return true;
+}
+
+void A10TcpServer::clear_ee_anchor_target_nrt()
+{
+    std::lock_guard<std::mutex> lk(ee_anchor_mutex_);
+    has_ee_anchor_ = false;
+    target_ee_anchor_ = a10_tcp::EeAnchorCommand{};
+}
+
+bool A10TcpServer::fetch_ee_anchor_if_updated(
+    a10_tcp::EeAnchorCommand& out,
+    std::uint64_t& out_seq,
+    std::uint64_t consumed_seq)
+{
+    std::lock_guard<std::mutex> lk(ee_anchor_mutex_);
+    const std::uint64_t seq = ee_anchor_seq_.load(std::memory_order_acquire);
+    out_seq = seq;
+    if (!has_ee_anchor_ || seq == 0 || seq == consumed_seq)
+    {
+        return false;
+    }
+    out = target_ee_anchor_;
     return true;
 }
 
@@ -437,6 +461,25 @@ void A10TcpServer::process_line(int client_sock, const std::string &line)
     if (line.find("GET_POLICY_STATUS") != std::string::npos)
     {
         send_policy_status(client_sock);
+        return;
+    }
+
+    // A2.2: anchored pose mailbox. vr_vel consumes it as diagnostics only.
+    if (line.find("SET_EE_ANCHOR") != std::string::npos)
+    {
+        a10_tcp::EeAnchorCommand command;
+        std::string error;
+        if (!a10_tcp::parse_ee_anchor_line(line, command, &error))
+        {
+            std::cout << "SET_EE_ANCHOR parse error: " << error << std::endl;
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(ee_anchor_mutex_);
+            target_ee_anchor_ = std::move(command);
+            has_ee_anchor_ = true;
+            (void)ee_anchor_seq_.fetch_add(1, std::memory_order_acq_rel);
+        }
         return;
     }
 

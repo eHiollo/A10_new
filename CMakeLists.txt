@@ -41,6 +41,7 @@ set(KAANHBIN_SOURCES
     plan.cpp
     robot.cpp
     a10_tcp_server.cpp
+    a10_anchor_protocol.cpp
     a10_policy_tcp_plan.cpp
     a10_vr_plan.cpp
     a10_vr_vel_plan.cpp

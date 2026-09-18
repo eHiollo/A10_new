@@ -17,6 +17,8 @@
 #include <thread>
 #include <vector>
 
+#include "a10_anchor_protocol.hpp"
+
 /// Thread-safe TCP server for A10 robot (line-delimited JSON protocol).
 class A10TcpServer
 {
@@ -41,6 +43,12 @@ public:
         std::vector<double>& out, std::uint64_t& out_seq, std::uint64_t consumed_seq);
     void clear_ee_delta_target_nrt();
     std::uint64_t ee_delta_seq() const;
+
+    bool fetch_ee_anchor_if_updated(
+        a10_tcp::EeAnchorCommand& out,
+        std::uint64_t& out_seq,
+        std::uint64_t consumed_seq);
+    void clear_ee_anchor_target_nrt();
 
 private:
     void acceptLoop();
@@ -71,6 +79,11 @@ private:
     std::mutex ee_delta_mutex_;
     std::vector<double> target_ee_delta_;
     std::atomic<std::uint64_t> ee_delta_seq_{0};
+
+    std::mutex ee_anchor_mutex_;
+    a10_tcp::EeAnchorCommand target_ee_anchor_;
+    bool has_ee_anchor_{false};
+    std::atomic<std::uint64_t> ee_anchor_seq_{0};
 };
 
 extern A10TcpServer* g_tcp_server;
