@@ -1679,6 +1679,14 @@
                         <Param name="rot_gain" abbreviation="g" default="1.0"/>
                         <Param name="timeout" abbreviation="t" default="0.12"/>
                         <Param name="grip_vel" abbreviation="h" default="50"/>
+                        <Param name="anchor_control" abbreviation="c" default="0"/>
+                        <Param name="ref_vmax" abbreviation="u" default="0.06"/>
+                        <Param name="ref_wmax" abbreviation="o" default="0.25"/>
+                        <Param name="track_pos" abbreviation="e" default="0.05"/>
+                        <Param name="track_rot" abbreviation="d" default="0.35"/>
+                        <Param name="track_fault_cycles" abbreviation="f" default="50"/>
+                        <Param name="anchor_timeout" abbreviation="s" default="0.25"/>
+                        <Param name="ik_fault_cycles" abbreviation="i" default="5"/>
                     </GroupParam>
                 </Command>
             </A10VrVelDriver>

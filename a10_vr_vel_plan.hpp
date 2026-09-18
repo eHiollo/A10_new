@@ -8,8 +8,8 @@
 
 namespace a10_tcp
 {
-/// VR P 速度遥操作：``SET_EE_DELTA`` 累加 ``target_pm``；``v = Kp×(target−actual)`` 限幅 + slew → IK。
-/// idle 时 ``target`` 缓慢贴回实测位姿。夹爪同 ``vr``。
+/// VR P 速度遥操作：默认 ``SET_EE_DELTA``；A2.3 可显式切换为锚点 reference governor。
+/// 两种模式复用同一套 ``target → P/限速/slew → command → IK`` 控制链。
 class A10VrVelDriver : public aris::core::CloneObject<A10VrVelDriver, aris::plan::Plan>
 {
 public:

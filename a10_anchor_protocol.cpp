@@ -94,7 +94,248 @@ void multiply_pm(const double left[16], const double right[16], double out[16])
         }
     }
 }
+
+double vec3_norm(const double value[3])
+{
+    return std::sqrt(
+        value[0] * value[0] + value[1] * value[1] + value[2] * value[2]);
+}
+
+void rotation_transpose_multiply(
+    const double left_pm[16], const double right_pm[16], double rotation[9])
+{
+    for (int row = 0; row < 3; ++row)
+    {
+        for (int column = 0; column < 3; ++column)
+        {
+            rotation[row * 3 + column] =
+                left_pm[row] * right_pm[column]
+                + left_pm[4 + row] * right_pm[4 + column]
+                + left_pm[8 + row] * right_pm[8 + column];
+        }
+    }
+}
+
+double rotation_angle(const double left_pm[16], const double right_pm[16])
+{
+    double relative[9]{};
+    rotation_transpose_multiply(left_pm, right_pm, relative);
+    const double cosine = std::clamp(
+        0.5 * (relative[0] + relative[4] + relative[8] - 1.0), -1.0, 1.0);
+    return std::acos(cosine);
+}
+
+void rotation_matrix_to_rotvec(const double rotation[9], double rotvec[3])
+{
+    const double cosine = std::clamp(
+        0.5 * (rotation[0] + rotation[4] + rotation[8] - 1.0), -1.0, 1.0);
+    const double angle = std::acos(cosine);
+    if (angle < 1e-12)
+    {
+        rotvec[0] = 0.0;
+        rotvec[1] = 0.0;
+        rotvec[2] = 0.0;
+        return;
+    }
+
+    const double sine = std::sin(angle);
+    if (std::abs(sine) > 1e-8)
+    {
+        const double scale = angle / (2.0 * sine);
+        rotvec[0] = (rotation[7] - rotation[5]) * scale;
+        rotvec[1] = (rotation[2] - rotation[6]) * scale;
+        rotvec[2] = (rotation[3] - rotation[1]) * scale;
+        return;
+    }
+
+    // Stable axis extraction close to pi, including mixed-sign axes.
+    const double diagonal[3] = {
+        std::max(0.0, 0.5 * (rotation[0] + 1.0)),
+        std::max(0.0, 0.5 * (rotation[4] + 1.0)),
+        std::max(0.0, 0.5 * (rotation[8] + 1.0)),
+    };
+    double axis[3]{};
+    if (diagonal[0] >= diagonal[1] && diagonal[0] >= diagonal[2])
+    {
+        axis[0] = std::sqrt(diagonal[0]);
+        const double divisor = std::max(4.0 * axis[0], 1e-12);
+        axis[1] = (rotation[1] + rotation[3]) / divisor;
+        axis[2] = (rotation[2] + rotation[6]) / divisor;
+    }
+    else if (diagonal[1] >= diagonal[2])
+    {
+        axis[1] = std::sqrt(diagonal[1]);
+        const double divisor = std::max(4.0 * axis[1], 1e-12);
+        axis[0] = (rotation[1] + rotation[3]) / divisor;
+        axis[2] = (rotation[5] + rotation[7]) / divisor;
+    }
+    else
+    {
+        axis[2] = std::sqrt(diagonal[2]);
+        const double divisor = std::max(4.0 * axis[2], 1e-12);
+        axis[0] = (rotation[2] + rotation[6]) / divisor;
+        axis[1] = (rotation[5] + rotation[7]) / divisor;
+    }
+    const double norm = vec3_norm(axis);
+    if (norm < 1e-12)
+    {
+        axis[0] = 1.0;
+        axis[1] = 0.0;
+        axis[2] = 0.0;
+    }
+    else
+    {
+        axis[0] /= norm;
+        axis[1] /= norm;
+        axis[2] /= norm;
+    }
+    rotvec[0] = axis[0] * angle;
+    rotvec[1] = axis[1] * angle;
+    rotvec[2] = axis[2] * angle;
+}
 }  // namespace
+
+const char* anchor_control_state_name(AnchorControlState state)
+{
+    switch (state)
+    {
+    case AnchorControlState::inactive: return "inactive";
+    case AnchorControlState::tracking: return "tracking";
+    case AnchorControlState::frozen: return "frozen";
+    case AnchorControlState::fault: return "fault";
+    }
+    return "unknown";
+}
+
+void EeAnchorReferenceGovernor::set_config(const AnchorGovernorConfig& config)
+{
+    config_ = config;
+    config_.max_reference_linear_speed_m_s =
+        std::max(0.0, config_.max_reference_linear_speed_m_s);
+    config_.max_reference_angular_speed_rad_s =
+        std::max(0.0, config_.max_reference_angular_speed_rad_s);
+    config_.max_tracking_error_m = std::max(0.0, config_.max_tracking_error_m);
+    config_.max_tracking_error_rad = std::max(0.0, config_.max_tracking_error_rad);
+    config_.fault_after_frozen_cycles =
+        std::max<std::uint32_t>(1, config_.fault_after_frozen_cycles);
+}
+
+void EeAnchorReferenceGovernor::set_reference(const double pm[16])
+{
+    std::copy_n(pm, reference_pm_.size(), reference_pm_.begin());
+}
+
+void EeAnchorReferenceGovernor::reset()
+{
+    state_ = AnchorControlState::inactive;
+    reference_pm_.fill(0.0);
+    tracking_error_m_ = 0.0;
+    tracking_error_rad_ = 0.0;
+    frozen_cycles_ = 0;
+}
+
+void EeAnchorReferenceGovernor::engage(const double actual_pm[16])
+{
+    set_reference(actual_pm);
+    state_ = AnchorControlState::tracking;
+    tracking_error_m_ = 0.0;
+    tracking_error_rad_ = 0.0;
+    frozen_cycles_ = 0;
+}
+
+void EeAnchorReferenceGovernor::release(const double actual_pm[16])
+{
+    set_reference(actual_pm);
+    state_ = AnchorControlState::inactive;
+    tracking_error_m_ = 0.0;
+    tracking_error_rad_ = 0.0;
+    frozen_cycles_ = 0;
+}
+
+void EeAnchorReferenceGovernor::force_fault(const double actual_pm[16])
+{
+    set_reference(actual_pm);
+    state_ = AnchorControlState::fault;
+    frozen_cycles_ = 0;
+}
+
+AnchorControlState EeAnchorReferenceGovernor::step(
+    const double user_target_pm[16], const double actual_pm[16], double dt_s)
+{
+    if (!control_active() || dt_s <= 0.0)
+    {
+        return state_;
+    }
+
+    const double tracking_translation[3] = {
+        reference_pm_[3] - actual_pm[3],
+        reference_pm_[7] - actual_pm[7],
+        reference_pm_[11] - actual_pm[11],
+    };
+    tracking_error_m_ = vec3_norm(tracking_translation);
+    tracking_error_rad_ = rotation_angle(reference_pm_.data(), actual_pm);
+    if (tracking_error_m_ > config_.max_tracking_error_m
+        || tracking_error_rad_ > config_.max_tracking_error_rad)
+    {
+        ++frozen_cycles_;
+        state_ = frozen_cycles_ >= config_.fault_after_frozen_cycles
+            ? AnchorControlState::fault
+            : AnchorControlState::frozen;
+        if (state_ == AnchorControlState::fault)
+        {
+            set_reference(actual_pm);
+        }
+        return state_;
+    }
+
+    frozen_cycles_ = 0;
+    state_ = AnchorControlState::tracking;
+
+    double translation_step[3] = {
+        user_target_pm[3] - reference_pm_[3],
+        user_target_pm[7] - reference_pm_[7],
+        user_target_pm[11] - reference_pm_[11],
+    };
+    const double translation_norm = vec3_norm(translation_step);
+    const double max_translation_step = config_.max_reference_linear_speed_m_s * dt_s;
+    if (translation_norm > max_translation_step && translation_norm > 1e-12)
+    {
+        const double scale = max_translation_step / translation_norm;
+        translation_step[0] *= scale;
+        translation_step[1] *= scale;
+        translation_step[2] *= scale;
+    }
+
+    double relative_rotation[9]{};
+    rotation_transpose_multiply(reference_pm_.data(), user_target_pm, relative_rotation);
+    double rotation_step[3]{};
+    rotation_matrix_to_rotvec(relative_rotation, rotation_step);
+    const double rotation_norm = vec3_norm(rotation_step);
+    const double max_rotation_step = config_.max_reference_angular_speed_rad_s * dt_s;
+    if (rotation_norm > max_rotation_step && rotation_norm > 1e-12)
+    {
+        const double scale = max_rotation_step / rotation_norm;
+        rotation_step[0] *= scale;
+        rotation_step[1] *= scale;
+        rotation_step[2] *= scale;
+    }
+
+    double incremental_rotation[9]{};
+    rotvec_to_rotation(rotation_step, incremental_rotation);
+    const double rotation_increment_pm[16] = {
+        incremental_rotation[0], incremental_rotation[1], incremental_rotation[2], 0.0,
+        incremental_rotation[3], incremental_rotation[4], incremental_rotation[5], 0.0,
+        incremental_rotation[6], incremental_rotation[7], incremental_rotation[8], 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    };
+    double advanced[16]{};
+    multiply_pm(reference_pm_.data(), rotation_increment_pm, advanced);
+    advanced[3] = reference_pm_[3] + translation_step[0];
+    advanced[7] = reference_pm_[7] + translation_step[1];
+    advanced[11] = reference_pm_[11] + translation_step[2];
+    set_reference(advanced);
+    return state_;
+}
 
 bool parse_ee_anchor_line(const std::string& line, EeAnchorCommand& out, std::string* error)
 {

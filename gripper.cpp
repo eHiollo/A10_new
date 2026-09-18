@@ -405,20 +405,32 @@ double BusServo::inverse_interpolate_mm_(int servo_pos,
   return table.back().first;
 }
 
-// 读取舵机当前开口（mm）
-double BusServo::get_position_mm(uint8_t servo_id,
-                                                const std::string& gripper_type) {
+// 读取舵机当前开口（mm）；返回 false 表示读取失败（不要用 0 当错误码）
+bool BusServo::try_get_position_mm(uint8_t servo_id,
+                                   const std::string& gripper_type,
+                                   double& out_mm) {
   auto it = gripper_calib_.find(gripper_type);
-  if (it == gripper_calib_.end()) return 0;
+  if (it == gripper_calib_.end()) {
+    std::cerr << "Error: Unknown gripper type '" << gripper_type << "'\n";
+    return false;
+  }
 
   auto s = read_sensor_data(servo_id);
-  if (!s) return 0;
+  if (!s) return false;
 
-  int pos = s->position; // 原始回读
-  // 有些舵机可能返回负数或超过范围，你可 clamp 一下
+  int pos = static_cast<int>(s->position); // 有些舵机可能返回负数或超范围
   pos = std::clamp(pos, 0, 4096);
 
-  double mm = inverse_interpolate_mm_(pos, it->second);
+  out_mm = inverse_interpolate_mm_(pos, it->second);
+  return true;
+}
+
+// 兼容旧接口：读失败时返回 0。
+// WARNING: 0 同时表示“闭合”，新代码请用 try_get_position_mm 以区分两者。
+double BusServo::get_position_mm(uint8_t servo_id,
+                                                const std::string& gripper_type) {
+  double mm = 0.0;
+  if (!try_get_position_mm(servo_id, gripper_type, mm)) return 0.0;
   return mm;
 }
 

@@ -29,7 +29,60 @@ enum class AnchorShadowUpdate
     stale,
 };
 
-/// A2.2 diagnostic-only robot/user anchor state. It never returns a motor command.
+enum class AnchorControlState
+{
+    inactive,
+    tracking,
+    frozen,
+    fault,
+};
+
+const char* anchor_control_state_name(AnchorControlState state);
+
+struct AnchorGovernorConfig
+{
+    double max_reference_linear_speed_m_s{0.06};
+    double max_reference_angular_speed_rad_s{0.25};
+    double max_tracking_error_m{0.05};
+    double max_tracking_error_rad{0.35};
+    std::uint32_t fault_after_frozen_cycles{50};
+};
+
+/// A2.3 bounded reference generator. It owns only the Cartesian reference;
+/// the existing vr_vel P/speed/slew/IK chain still owns the motor command.
+class EeAnchorReferenceGovernor
+{
+public:
+    void set_config(const AnchorGovernorConfig& config);
+    void reset();
+    void engage(const double actual_pm[16]);
+    void release(const double actual_pm[16]);
+    void force_fault(const double actual_pm[16]);
+    AnchorControlState step(
+        const double user_target_pm[16], const double actual_pm[16], double dt_s);
+
+    AnchorControlState state() const { return state_; }
+    bool control_active() const
+    {
+        return state_ == AnchorControlState::tracking || state_ == AnchorControlState::frozen;
+    }
+    const std::array<double, 16>& reference_pm() const { return reference_pm_; }
+    double tracking_error_m() const { return tracking_error_m_; }
+    double tracking_error_rad() const { return tracking_error_rad_; }
+    std::uint32_t frozen_cycles() const { return frozen_cycles_; }
+
+private:
+    void set_reference(const double pm[16]);
+
+    AnchorGovernorConfig config_;
+    AnchorControlState state_{AnchorControlState::inactive};
+    std::array<double, 16> reference_pm_{};
+    double tracking_error_m_{0.0};
+    double tracking_error_rad_{0.0};
+    std::uint32_t frozen_cycles_{0};
+};
+
+/// A2.2/A2.3 robot/user anchor state. Motor ownership remains in vr_vel.
 class EeAnchorShadow
 {
 public:

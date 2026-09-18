@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <rtb.hpp>
@@ -326,9 +327,18 @@ struct A10VrVelDriver::Imp
     std::uint64_t consumed_ee_delta_seq_{0};
     std::uint64_t consumed_ee_anchor_seq_{0};
     EeAnchorShadow anchor_shadow_;
+    EeAnchorReferenceGovernor anchor_governor_;
     std::int64_t last_packet_count_{0};
+    std::int64_t last_anchor_packet_count_{0};
     bool inited_{false};
     bool idle_coast_{false};
+    bool anchor_control_enabled_{false};
+    bool anchor_fault_latched_{false};
+    std::string anchor_fault_session_;
+    std::uint64_t anchor_fault_id_{0};
+    std::string anchor_fault_reason_;
+    std::uint32_t anchor_ik_fail_cycles_{0};
+    std::uint32_t max_anchor_ik_fail_cycles_{5};
 
     double max_lin_vel_{0.12};
     double max_ang_vel_{0.4};
@@ -339,6 +349,7 @@ struct A10VrVelDriver::Imp
     double kp_rot_{2.0};
     double rot_gain_{1.0};
     double timeout_s_{0.12};
+    double anchor_timeout_s_{0.25};
 
     void apply_joints_to_motors(aris::plan::Plan& plan)
     {
@@ -364,6 +375,61 @@ struct A10VrVelDriver::Imp
         w_cmd_tool[1] = 0.0;
         w_cmd_tool[2] = 0.0;
     }
+
+    void sync_control_pose_to_actual(const double actual_pm[16])
+    {
+        std::memcpy(target_pm, actual_pm, sizeof(target_pm));
+        std::memcpy(command_pm, actual_pm, sizeof(command_pm));
+        zero_motion_state();
+        idle_coast_ = true;
+        anchor_ik_fail_cycles_ = 0;
+    }
+
+    void engage_anchor_control(const double actual_pm[16])
+    {
+        anchor_fault_latched_ = false;
+        anchor_fault_session_.clear();
+        anchor_fault_id_ = 0;
+        anchor_fault_reason_.clear();
+        anchor_governor_.engage(actual_pm);
+        sync_control_pose_to_actual(actual_pm);
+        idle_coast_ = false;
+    }
+
+    void release_anchor_control(const double actual_pm[16])
+    {
+        anchor_fault_latched_ = false;
+        anchor_fault_session_.clear();
+        anchor_fault_id_ = 0;
+        anchor_fault_reason_.clear();
+        anchor_governor_.release(actual_pm);
+        sync_control_pose_to_actual(actual_pm);
+    }
+
+    bool enter_anchor_fault(
+        const double actual_pm[16],
+        const std::string& reason,
+        const std::string& session_id,
+        std::uint64_t anchor_id)
+    {
+        const bool newly_latched =
+            !anchor_fault_latched_ || anchor_fault_session_ != session_id
+            || anchor_fault_id_ != anchor_id || anchor_fault_reason_ != reason;
+        anchor_fault_latched_ = true;
+        anchor_fault_session_ = session_id;
+        anchor_fault_id_ = anchor_id;
+        anchor_fault_reason_ = reason;
+        anchor_governor_.force_fault(actual_pm);
+        sync_control_pose_to_actual(actual_pm);
+        return newly_latched;
+    }
+
+    bool anchor_command_blocked_by_fault(const EeAnchorCommand& command) const
+    {
+        return anchor_fault_latched_ && command.active
+            && command.session_id == anchor_fault_session_
+            && command.anchor_id <= anchor_fault_id_;
+    }
 };
 
 auto A10VrVelDriver::prepareNrt() -> void
@@ -373,7 +439,14 @@ auto A10VrVelDriver::prepareNrt() -> void
     imp_->consumed_ee_delta_seq_ = 0;
     imp_->consumed_ee_anchor_seq_ = 0;
     imp_->anchor_shadow_.reset();
+    imp_->anchor_governor_.reset();
     imp_->last_packet_count_ = 0;
+    imp_->last_anchor_packet_count_ = 0;
+    imp_->anchor_fault_latched_ = false;
+    imp_->anchor_fault_session_.clear();
+    imp_->anchor_fault_id_ = 0;
+    imp_->anchor_fault_reason_.clear();
+    imp_->anchor_ik_fail_cycles_ = 0;
     imp_->zero_motion_state();
     g_a10_vr_stop_requested.store(false, std::memory_order_release);
 
@@ -437,10 +510,45 @@ auto A10VrVelDriver::executeRT() -> int
         if (doubleParam("kp_rot") >= 0.0) imp_->kp_rot_ = doubleParam("kp_rot");
         if (doubleParam("rot_gain") > 1e-9) imp_->rot_gain_ = doubleParam("rot_gain");
         if (doubleParam("timeout") > 1e-9) imp_->timeout_s_ = doubleParam("timeout");
+        imp_->anchor_control_enabled_ = doubleParam("anchor_control") >= 0.5;
+        if (doubleParam("anchor_timeout") > 1e-9)
+        {
+            imp_->anchor_timeout_s_ = doubleParam("anchor_timeout");
+        }
+        if (doubleParam("ik_fault_cycles") >= 1.0)
+        {
+            imp_->max_anchor_ik_fail_cycles_ = static_cast<std::uint32_t>(
+                std::max(1.0, std::round(doubleParam("ik_fault_cycles"))));
+        }
+        AnchorGovernorConfig governor_config;
+        if (doubleParam("ref_vmax") > 1e-9)
+        {
+            governor_config.max_reference_linear_speed_m_s = doubleParam("ref_vmax");
+        }
+        if (doubleParam("ref_wmax") > 1e-9)
+        {
+            governor_config.max_reference_angular_speed_rad_s = doubleParam("ref_wmax");
+        }
+        if (doubleParam("track_pos") > 1e-9)
+        {
+            governor_config.max_tracking_error_m = doubleParam("track_pos");
+        }
+        if (doubleParam("track_rot") > 1e-9)
+        {
+            governor_config.max_tracking_error_rad = doubleParam("track_rot");
+        }
+        if (doubleParam("track_fault_cycles") >= 1.0)
+        {
+            governor_config.fault_after_frozen_cycles = static_cast<std::uint32_t>(
+                std::max(1.0, std::round(doubleParam("track_fault_cycles"))));
+        }
+        imp_->anchor_governor_.set_config(governor_config);
         if (doubleParam("grip_vel") > 1e-9)
         {
             g_vr_grip_vel_mm_s.store(doubleParam("grip_vel"), std::memory_order_release);
         }
+        mout() << "vr_vel: anchor_control=" << (imp_->anchor_control_enabled_ ? "on" : "off")
+               << " (default/off keeps SET_EE_DELTA arm control)" << std::endl;
     }
 
     for (int i = 0; i < k_joint_num; ++i)
@@ -463,8 +571,10 @@ auto A10VrVelDriver::executeRT() -> int
         std::memcpy(imp_->command_pm, T_base_to_ee, sizeof(imp_->command_pm));
         std::memcpy(imp_->output_joints, imp_->current_joints, sizeof(imp_->output_joints));
         std::memcpy(imp_->ik_joints, imp_->current_joints, sizeof(imp_->ik_joints));
+        imp_->anchor_governor_.release(T_base_to_ee);
         imp_->zero_motion_state();
         imp_->last_packet_count_ = count();
+        imp_->last_anchor_packet_count_ = count();
         sync_vr_grip_target_from_actual(g_vr_grip_actual_mm.load(std::memory_order_acquire));
         imp_->inited_ = true;
         mout() << "vr_vel: init ok (P velocity, target+=delta, tool-frame)" << std::endl;
@@ -478,19 +588,59 @@ auto A10VrVelDriver::executeRT() -> int
     {
         imp_->consumed_ee_anchor_seq_ = anchor_mailbox_seq;
         const bool anchor_was_active = imp_->anchor_shadow_.active();
-        const AnchorShadowUpdate update =
-            imp_->anchor_shadow_.update(anchor_command, T_base_to_ee);
+        AnchorShadowUpdate update = AnchorShadowUpdate::duplicate;
+        bool update_applied = false;
+        if (!imp_->anchor_control_enabled_)
+        {
+            update = imp_->anchor_shadow_.update(anchor_command, T_base_to_ee);
+            update_applied = true;
+        }
+        else if (!anchor_command.active)
+        {
+            update = imp_->anchor_shadow_.update(anchor_command, T_base_to_ee);
+            update_applied = true;
+            imp_->last_anchor_packet_count_ = count();
+            imp_->release_anchor_control(T_base_to_ee);
+        }
+        else if (!imp_->anchor_command_blocked_by_fault(anchor_command))
+        {
+            if (imp_->anchor_fault_latched_)
+            {
+                imp_->anchor_fault_latched_ = false;
+                imp_->anchor_fault_reason_.clear();
+            }
+            update = imp_->anchor_shadow_.update(anchor_command, T_base_to_ee);
+            update_applied = true;
+            imp_->last_anchor_packet_count_ = count();
+            if (update == AnchorShadowUpdate::anchored)
+            {
+                imp_->engage_anchor_control(T_base_to_ee);
+            }
+            else if (update == AnchorShadowUpdate::stale)
+            {
+                if (imp_->enter_anchor_fault(
+                        T_base_to_ee,
+                        "stale_sequence",
+                        imp_->anchor_shadow_.session_id(),
+                        imp_->anchor_shadow_.anchor_id()))
+                {
+                    mout() << "vr_vel A2.3 fault: stale sequence; release/re-anchor required"
+                           << std::endl;
+                }
+            }
+        }
         if (update == AnchorShadowUpdate::anchored)
         {
-            mout() << "vr_vel A2.2 shadow: anchored session="
+            mout() << "vr_vel anchor: anchored session="
                    << imp_->anchor_shadow_.session_id()
                    << " anchor=" << imp_->anchor_shadow_.anchor_id()
                    << " sample=" << imp_->anchor_shadow_.sample_sequence()
-                   << " (diagnostic only)" << std::endl;
+                   << (imp_->anchor_control_enabled_ ? " control=true" : " diagnostic_only=true")
+                   << std::endl;
         }
-        else if (update == AnchorShadowUpdate::inactive && anchor_was_active)
+        else if (update_applied && update == AnchorShadowUpdate::inactive && anchor_was_active)
         {
-            mout() << "vr_vel A2.2 shadow: inactive (diagnostic only)" << std::endl;
+            mout() << "vr_vel anchor: inactive" << std::endl;
         }
     }
 
@@ -507,22 +657,93 @@ auto A10VrVelDriver::executeRT() -> int
         {
             set_vr_grip_cmd(delta[6]);
         }
-        if (is_effective_motion_delta(delta, imp_->rot_gain_))
+        if (!imp_->anchor_control_enabled_ && is_effective_motion_delta(delta, imp_->rot_gain_))
         {
             imp_->idle_coast_ = false;
             apply_vr_delta_to_target(imp_->target_pm, delta, imp_->rot_gain_);
         }
-        else
+        else if (!imp_->anchor_control_enabled_)
         {
             imp_->idle_coast_ = true;
         }
     }
-    else if (elapsed_since_packet > imp_->timeout_s_)
+    else if (!imp_->anchor_control_enabled_ && elapsed_since_packet > imp_->timeout_s_)
     {
         imp_->idle_coast_ = true;
     }
 
-    if (imp_->idle_coast_)
+    // 夹爪速度指令超时保护：g_vr_grip_cmd 是“速度”，服务线程会持续按 k_dt 积分它。
+    // 不清零的话，链路断开后它会按最后一个值把夹爪一直推到行程末端（顶死/夹手）。
+    // 与 anchor 模式无关，单独处理。
+    if (elapsed_since_packet > imp_->timeout_s_)
+    {
+        clear_vr_grip_cmd();
+    }
+
+    if (imp_->anchor_control_enabled_)
+    {
+        const double anchor_age_s =
+            static_cast<double>(count() - imp_->last_anchor_packet_count_) * k_dt;
+        if (imp_->anchor_governor_.control_active() && anchor_age_s > imp_->anchor_timeout_s_)
+        {
+            if (imp_->enter_anchor_fault(
+                    T_base_to_ee,
+                    "anchor_timeout",
+                    imp_->anchor_shadow_.session_id(),
+                    imp_->anchor_shadow_.anchor_id()))
+            {
+                mout() << "vr_vel A2.3 fault: anchor timeout; release/re-anchor required"
+                       << std::endl;
+            }
+        }
+
+        if (imp_->anchor_governor_.control_active() && imp_->anchor_shadow_.active())
+        {
+            const AnchorControlState previous_state = imp_->anchor_governor_.state();
+            const AnchorControlState state = imp_->anchor_governor_.step(
+                imp_->anchor_shadow_.user_target_pm().data(), T_base_to_ee, k_dt);
+            if (state == AnchorControlState::fault)
+            {
+                if (imp_->enter_anchor_fault(
+                        T_base_to_ee,
+                        "tracking_error",
+                        imp_->anchor_shadow_.session_id(),
+                        imp_->anchor_shadow_.anchor_id()))
+                {
+                    mout() << "vr_vel A2.3 fault: tracking error persisted; re-anchor required"
+                           << std::endl;
+                }
+            }
+            else
+            {
+                std::memcpy(
+                    imp_->target_pm,
+                    imp_->anchor_governor_.reference_pm().data(),
+                    sizeof(imp_->target_pm));
+                imp_->idle_coast_ = false;
+                if (state != previous_state)
+                {
+                    mout() << "vr_vel A2.3 state: " << anchor_control_state_name(state)
+                           << " track_pos=" << imp_->anchor_governor_.tracking_error_m()
+                           << " track_rot=" << imp_->anchor_governor_.tracking_error_rad()
+                           << std::endl;
+                }
+            }
+        }
+        else
+        {
+            if (imp_->anchor_governor_.state() == AnchorControlState::fault)
+            {
+                imp_->anchor_governor_.force_fault(T_base_to_ee);
+            }
+            else
+            {
+                imp_->anchor_governor_.release(T_base_to_ee);
+            }
+            imp_->sync_control_pose_to_actual(T_base_to_ee);
+        }
+    }
+    else if (imp_->idle_coast_)
     {
         const double alpha = 1.0 - imp_->target_pull_;
         pull_target_toward_actual(imp_->target_pm, T_base_to_ee, alpha);
@@ -559,12 +780,26 @@ auto A10VrVelDriver::executeRT() -> int
         {
             const auto& robot_anchor = imp_->anchor_shadow_.robot_anchor_pm();
             const auto& user_target = imp_->anchor_shadow_.user_target_pm();
-            mout() << "vr_vel A2.2 shadow: anchor=" << imp_->anchor_shadow_.anchor_id()
+            mout() << "vr_vel anchor: anchor=" << imp_->anchor_shadow_.anchor_id()
                    << " sample=" << imp_->anchor_shadow_.sample_sequence()
                    << " robot_xyz=[" << robot_anchor[3] << "," << robot_anchor[7] << ","
                    << robot_anchor[11] << "] user_xyz=[" << user_target[3] << ","
                    << user_target[7] << "," << user_target[11]
-                   << "] diagnostic_only=true" << std::endl;
+                   << "] diagnostic_only=" << (imp_->anchor_control_enabled_ ? "false" : "true")
+                   << std::endl;
+        }
+        if (imp_->anchor_control_enabled_)
+        {
+            const auto& reference = imp_->anchor_governor_.reference_pm();
+            mout() << "vr_vel A2.3 control: state="
+                   << anchor_control_state_name(imp_->anchor_governor_.state())
+                   << " ref_xyz=[" << reference[3] << "," << reference[7] << ","
+                   << reference[11] << "] actual_xyz=[" << T_base_to_ee[3] << ","
+                   << T_base_to_ee[7] << "," << T_base_to_ee[11] << "] track_pos="
+                   << imp_->anchor_governor_.tracking_error_m() << " track_rot="
+                   << imp_->anchor_governor_.tracking_error_rad() << " fault="
+                   << (imp_->anchor_fault_reason_.empty() ? "none" : imp_->anchor_fault_reason_)
+                   << std::endl;
         }
     }
 
@@ -572,6 +807,7 @@ auto A10VrVelDriver::executeRT() -> int
     ee.setMpm(imp_->command_pm);
     if (!arm.inverseKinematics())
     {
+        imp_->anchor_ik_fail_cycles_ = 0;
         arm.getInputPos(imp_->ik_joints);
         for (int i = 0; i < k_joint_num; ++i)
         {
@@ -579,10 +815,29 @@ auto A10VrVelDriver::executeRT() -> int
         }
         std::memcpy(imp_->output_joints, imp_->ik_joints, sizeof(imp_->output_joints));
     }
-    else if (count() % 500 == 0)
+    else
     {
-        mout() << "vr_vel: IK fail, |e_pos|=" << vec3_norm(e_pos_tool)
-               << "m |e_rot|=" << vec3_norm(e_rot_tool) << "rad" << std::endl;
+        if (imp_->anchor_control_enabled_ && imp_->anchor_governor_.control_active())
+        {
+            ++imp_->anchor_ik_fail_cycles_;
+            if (imp_->anchor_ik_fail_cycles_ >= imp_->max_anchor_ik_fail_cycles_)
+            {
+                if (imp_->enter_anchor_fault(
+                        T_base_to_ee,
+                        "ik_failure",
+                        imp_->anchor_shadow_.session_id(),
+                        imp_->anchor_shadow_.anchor_id()))
+                {
+                    mout() << "vr_vel A2.3 fault: repeated IK failure; re-anchor required"
+                           << std::endl;
+                }
+            }
+        }
+        if (count() % 500 == 0)
+        {
+            mout() << "vr_vel: IK fail, |e_pos|=" << vec3_norm(e_pos_tool)
+                   << "m |e_rot|=" << vec3_norm(e_rot_tool) << "rad" << std::endl;
+        }
     }
 
     imp_->apply_joints_to_motors(*this);
@@ -606,6 +861,14 @@ A10VrVelDriver::A10VrVelDriver(const std::string& name) : imp_(new Imp)
         "    <Param name=\"rot_gain\" abbreviation=\"g\" default=\"1.0\"/>"
         "    <Param name=\"timeout\" abbreviation=\"t\" default=\"0.12\"/>"
         "    <Param name=\"grip_vel\" abbreviation=\"h\" default=\"50\"/>"
+        "    <Param name=\"anchor_control\" abbreviation=\"c\" default=\"0\"/>"
+        "    <Param name=\"ref_vmax\" abbreviation=\"u\" default=\"0.06\"/>"
+        "    <Param name=\"ref_wmax\" abbreviation=\"o\" default=\"0.25\"/>"
+        "    <Param name=\"track_pos\" abbreviation=\"e\" default=\"0.05\"/>"
+        "    <Param name=\"track_rot\" abbreviation=\"d\" default=\"0.35\"/>"
+        "    <Param name=\"track_fault_cycles\" abbreviation=\"f\" default=\"50\"/>"
+        "    <Param name=\"anchor_timeout\" abbreviation=\"s\" default=\"0.25\"/>"
+        "    <Param name=\"ik_fault_cycles\" abbreviation=\"i\" default=\"5\"/>"
         "  </GroupParam>"
         "</Command>");
 }
