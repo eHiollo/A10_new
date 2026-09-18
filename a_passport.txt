@@ -16,6 +16,9 @@ python run_bridge.py \
   --robot-host 127.0.0.1 --robot-port 8080 \
   --hz 10
 
+# 启动vr控制
+vr_vel --anchor_control=1 --ref_vmax=0.12 --ref_wmax=0.4
+
 阶段一：部署俊扬算法
 已完成：
     1.Jetson AGX Thor刷机与项目环境配置
