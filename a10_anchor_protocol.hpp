@@ -39,6 +39,11 @@ enum class AnchorControlState
 
 const char* anchor_control_state_name(AnchorControlState state);
 
+/// Shared shaping helpers used by A2.3 and covered without the robot SDK.
+double slew_toward(double current, double target, double max_delta);
+double effective_anchor_speed_limit(
+    double controller_speed_limit, double reference_speed_limit);
+
 struct AnchorGovernorConfig
 {
     double max_reference_linear_speed_m_s{0.06};

@@ -270,6 +270,42 @@ void test_reference_governor_handles_pi_rotation_with_mixed_axis_signs()
     assert(governor.reference_pm()[2] < 0.0);
     assert(governor.reference_pm()[6] < 0.0);
 }
+
+void test_anchor_speed_cap_and_smooth_stop_step()
+{
+    expect_near(a10_tcp::effective_anchor_speed_limit(0.12, 0.06), 0.06);
+    expect_near(a10_tcp::effective_anchor_speed_limit(0.04, 0.06), 0.04);
+
+    constexpr double dt_s = 0.002;
+    constexpr double max_acc_m_s2 = 0.8;
+    const double first_stop_step =
+        a10_tcp::slew_toward(0.06, 0.0, max_acc_m_s2 * dt_s);
+    expect_near(first_stop_step, 0.0584);
+    assert(first_stop_step > 0.0);
+
+    double linear_velocity = 0.06;
+    int linear_steps = 0;
+    while (linear_velocity > 0.0)
+    {
+        const double previous = linear_velocity;
+        linear_velocity = a10_tcp::slew_toward(
+            linear_velocity, 0.0, max_acc_m_s2 * dt_s);
+        assert(linear_velocity >= 0.0);
+        assert(linear_velocity < previous);
+        ++linear_steps;
+    }
+    assert(linear_steps == 38);
+
+    double angular_velocity = 0.2;
+    int angular_steps = 0;
+    while (angular_velocity > 0.0)
+    {
+        angular_velocity = a10_tcp::slew_toward(
+            angular_velocity, 0.0, 1.5 * dt_s);
+        ++angular_steps;
+    }
+    assert(angular_steps == 67);
+}
 }  // namespace
 
 int main()
@@ -280,6 +316,7 @@ int main()
     test_reference_governor_freezes_faults_and_discards_backlog();
     test_reference_governor_recovers_from_short_freeze();
     test_reference_governor_handles_pi_rotation_with_mixed_axis_signs();
+    test_anchor_speed_cap_and_smooth_stop_step();
     std::cout << "a10_anchor_protocol_test: PASS" << std::endl;
     return 0;
 }

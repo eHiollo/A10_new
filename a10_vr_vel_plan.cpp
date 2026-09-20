@@ -77,8 +77,7 @@ void slew_vec3(double* v, const double* v_target, double max_dv)
 {
     for (int i = 0; i < 3; ++i)
     {
-        const double dv = std::clamp(v_target[i] - v[i], -max_dv, max_dv);
-        v[i] += dv;
+        v[i] = slew_toward(v[i], v_target[i], max_dv);
     }
 }
 
@@ -350,6 +349,8 @@ struct A10VrVelDriver::Imp
     double rot_gain_{1.0};
     double timeout_s_{0.12};
     double anchor_timeout_s_{0.25};
+    double anchor_ref_max_lin_vel_{0.06};
+    double anchor_ref_max_ang_vel_{0.25};
 
     void apply_joints_to_motors(aris::plan::Plan& plan)
     {
@@ -376,11 +377,9 @@ struct A10VrVelDriver::Imp
         w_cmd_tool[2] = 0.0;
     }
 
-    void sync_control_pose_to_actual(const double actual_pm[16])
+    void retarget_to_actual_for_smooth_stop(const double actual_pm[16])
     {
         std::memcpy(target_pm, actual_pm, sizeof(target_pm));
-        std::memcpy(command_pm, actual_pm, sizeof(command_pm));
-        zero_motion_state();
         idle_coast_ = true;
         anchor_ik_fail_cycles_ = 0;
     }
@@ -392,7 +391,8 @@ struct A10VrVelDriver::Imp
         anchor_fault_id_ = 0;
         anchor_fault_reason_.clear();
         anchor_governor_.engage(actual_pm);
-        sync_control_pose_to_actual(actual_pm);
+        std::memcpy(target_pm, actual_pm, sizeof(target_pm));
+        anchor_ik_fail_cycles_ = 0;
         idle_coast_ = false;
     }
 
@@ -403,7 +403,7 @@ struct A10VrVelDriver::Imp
         anchor_fault_id_ = 0;
         anchor_fault_reason_.clear();
         anchor_governor_.release(actual_pm);
-        sync_control_pose_to_actual(actual_pm);
+        retarget_to_actual_for_smooth_stop(actual_pm);
     }
 
     bool enter_anchor_fault(
@@ -420,7 +420,7 @@ struct A10VrVelDriver::Imp
         anchor_fault_id_ = anchor_id;
         anchor_fault_reason_ = reason;
         anchor_governor_.force_fault(actual_pm);
-        sync_control_pose_to_actual(actual_pm);
+        retarget_to_actual_for_smooth_stop(actual_pm);
         return newly_latched;
     }
 
@@ -542,12 +542,18 @@ auto A10VrVelDriver::executeRT() -> int
             governor_config.fault_after_frozen_cycles = static_cast<std::uint32_t>(
                 std::max(1.0, std::round(doubleParam("track_fault_cycles"))));
         }
+        imp_->anchor_ref_max_lin_vel_ = governor_config.max_reference_linear_speed_m_s;
+        imp_->anchor_ref_max_ang_vel_ = governor_config.max_reference_angular_speed_rad_s;
         imp_->anchor_governor_.set_config(governor_config);
         if (doubleParam("grip_vel") > 1e-9)
         {
             g_vr_grip_vel_mm_s.store(doubleParam("grip_vel"), std::memory_order_release);
         }
         mout() << "vr_vel: anchor_control=" << (imp_->anchor_control_enabled_ ? "on" : "off")
+               << " ref_vmax=" << imp_->anchor_ref_max_lin_vel_
+               << " ref_wmax=" << imp_->anchor_ref_max_ang_vel_
+               << " vmax=" << imp_->max_lin_vel_ << " wmax=" << imp_->max_ang_vel_
+               << " amax=" << imp_->max_lin_acc_ << " jacc=" << imp_->max_ang_acc_
                << " (default/off keeps SET_EE_DELTA arm control)" << std::endl;
     }
 
@@ -640,7 +646,9 @@ auto A10VrVelDriver::executeRT() -> int
         }
         else if (update_applied && update == AnchorShadowUpdate::inactive && anchor_was_active)
         {
-            mout() << "vr_vel anchor: inactive" << std::endl;
+            mout() << "vr_vel anchor: inactive; smooth_stop |v|="
+                   << vec3_norm(imp_->v_cmd_tool) << " |w|="
+                   << vec3_norm(imp_->w_cmd_tool) << std::endl;
         }
     }
 
@@ -740,7 +748,7 @@ auto A10VrVelDriver::executeRT() -> int
             {
                 imp_->anchor_governor_.release(T_base_to_ee);
             }
-            imp_->sync_control_pose_to_actual(T_base_to_ee);
+            imp_->retarget_to_actual_for_smooth_stop(T_base_to_ee);
         }
     }
     else if (imp_->idle_coast_)
@@ -753,18 +761,36 @@ auto A10VrVelDriver::executeRT() -> int
     double e_rot_tool[3]{};
     pose_error_tool(imp_->target_pm, T_base_to_ee, e_pos_tool, e_rot_tool);
 
-    double v_target_tool[3] = {
-        imp_->kp_pos_ * e_pos_tool[0],
-        imp_->kp_pos_ * e_pos_tool[1],
-        imp_->kp_pos_ * e_pos_tool[2],
-    };
-    double w_target_tool[3] = {
-        imp_->kp_rot_ * e_rot_tool[0],
-        imp_->kp_rot_ * e_rot_tool[1],
-        imp_->kp_rot_ * e_rot_tool[2],
-    };
-    clamp_vec3(v_target_tool, imp_->max_lin_vel_);
-    clamp_vec3(w_target_tool, imp_->max_ang_vel_);
+    double v_target_tool[3]{};
+    double w_target_tool[3]{};
+    // Release/fault must not snap command_pm to measured FK or clear velocity in one
+    // 2 ms cycle. A zero velocity target keeps command_pm continuous and reuses the
+    // validated amax/jacc slew path for controlled braking.
+    const bool anchor_smooth_stopping =
+        imp_->anchor_control_enabled_ && !imp_->anchor_governor_.control_active();
+    if (!anchor_smooth_stopping)
+    {
+        v_target_tool[0] = imp_->kp_pos_ * e_pos_tool[0];
+        v_target_tool[1] = imp_->kp_pos_ * e_pos_tool[1];
+        v_target_tool[2] = imp_->kp_pos_ * e_pos_tool[2];
+        w_target_tool[0] = imp_->kp_rot_ * e_rot_tool[0];
+        w_target_tool[1] = imp_->kp_rot_ * e_rot_tool[1];
+        w_target_tool[2] = imp_->kp_rot_ * e_rot_tool[2];
+    }
+
+    double linear_speed_limit = imp_->max_lin_vel_;
+    double angular_speed_limit = imp_->max_ang_vel_;
+    // In anchor mode ref_vmax/ref_wmax are also the final Cartesian envelope,
+    // not only the rate at which the reference governor advances.
+    if (imp_->anchor_control_enabled_)
+    {
+        linear_speed_limit = effective_anchor_speed_limit(
+            linear_speed_limit, imp_->anchor_ref_max_lin_vel_);
+        angular_speed_limit = effective_anchor_speed_limit(
+            angular_speed_limit, imp_->anchor_ref_max_ang_vel_);
+    }
+    clamp_vec3(v_target_tool, linear_speed_limit);
+    clamp_vec3(w_target_tool, angular_speed_limit);
 
     slew_vec3(imp_->v_cmd_tool, v_target_tool, imp_->max_lin_acc_ * k_dt);
     slew_vec3(imp_->w_cmd_tool, w_target_tool, imp_->max_ang_acc_ * k_dt);
@@ -775,7 +801,7 @@ auto A10VrVelDriver::executeRT() -> int
     {
         mout() << "vr_vel diag: |e_pos|=" << vec3_norm(e_pos_tool) << "m |e_rot|=" << vec3_norm(e_rot_tool)
                << "rad |v|=" << vec3_norm(imp_->v_cmd_tool) << " |w|=" << vec3_norm(imp_->w_cmd_tool)
-               << (imp_->idle_coast_ ? " idle" : "") << std::endl;
+               << (imp_->idle_coast_ ? " smooth_stop" : "") << std::endl;
         if (imp_->anchor_shadow_.active())
         {
             const auto& robot_anchor = imp_->anchor_shadow_.robot_anchor_pm();

@@ -207,6 +207,19 @@ const char* anchor_control_state_name(AnchorControlState state)
     return "unknown";
 }
 
+double slew_toward(double current, double target, double max_delta)
+{
+    const double bounded_delta = std::max(0.0, max_delta);
+    return current + std::clamp(target - current, -bounded_delta, bounded_delta);
+}
+
+double effective_anchor_speed_limit(
+    double controller_speed_limit, double reference_speed_limit)
+{
+    return std::max(
+        0.0, std::min(controller_speed_limit, reference_speed_limit));
+}
+
 void EeAnchorReferenceGovernor::set_config(const AnchorGovernorConfig& config)
 {
     config_ = config;
