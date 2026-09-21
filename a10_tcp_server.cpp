@@ -1,7 +1,9 @@
 #include "a10_tcp_server.hpp"
 
 #include <algorithm>
+#include <iostream>
 
+#include "a10_vr_plan.hpp"
 #include "kaanh/general/json.hpp"
 
 A10TcpServer::A10TcpServer()
@@ -470,6 +472,14 @@ void A10TcpServer::process_line(
     if (line.find("GET_POLICY_STATUS") != std::string::npos)
     {
         send_policy_status(client_sock);
+        return;
+    }
+
+    // Same flag as the Shell ``reset`` command: vr_vel homes without leaving RT.
+    if (line.compare(0, 5, "RESET") == 0)
+    {
+        a10_tcp::request_vr_init();
+        std::cout << "RESET: requested, vr_vel RT will home" << std::endl;
         return;
     }
 
