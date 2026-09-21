@@ -306,6 +306,32 @@ void test_anchor_speed_cap_and_smooth_stop_step()
     }
     assert(angular_steps == 67);
 }
+
+void test_joint_limit_hold_keeps_tracking_monitor_live()
+{
+    const double identity[16] = {
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    double target[16], actual[16];
+    std::copy_n(identity, 16, target);
+    std::copy_n(identity, 16, actual);
+    target[3] = 0.1;
+    a10_tcp::EeAnchorReferenceGovernor governor;
+    a10_tcp::AnchorGovernorConfig config;
+    config.fault_after_frozen_cycles = 2;
+    governor.set_config(config);
+    governor.engage(identity);
+    assert(governor.step(target, actual, 0.002, true) == a10_tcp::AnchorControlState::frozen);
+    expect_near(governor.reference_pm()[3], 0.0);
+    actual[3] = 0.02;
+    governor.step(target, actual, 0.002, true);
+    expect_near(governor.tracking_error_m(), 0.02);
+    expect_near(governor.reference_pm()[3], 0.0);
+    assert(governor.step(target, actual, 0.002) == a10_tcp::AnchorControlState::tracking);
+    assert(governor.reference_pm()[3] > 0.0);
+    actual[3] = -0.1;
+    assert(governor.step(target, actual, 0.002, true) == a10_tcp::AnchorControlState::frozen);
+    assert(governor.step(target, actual, 0.002, true) == a10_tcp::AnchorControlState::fault);
+}
 }  // namespace
 
 int main()
@@ -317,6 +343,7 @@ int main()
     test_reference_governor_recovers_from_short_freeze();
     test_reference_governor_handles_pi_rotation_with_mixed_axis_signs();
     test_anchor_speed_cap_and_smooth_stop_step();
+    test_joint_limit_hold_keeps_tracking_monitor_live();
     std::cout << "a10_anchor_protocol_test: PASS" << std::endl;
     return 0;
 }

@@ -273,7 +273,8 @@ void EeAnchorReferenceGovernor::force_fault(const double actual_pm[16])
 }
 
 AnchorControlState EeAnchorReferenceGovernor::step(
-    const double user_target_pm[16], const double actual_pm[16], double dt_s)
+    const double user_target_pm[16], const double actual_pm[16], double dt_s,
+    bool hold_reference)
 {
     if (!control_active() || dt_s <= 0.0)
     {
@@ -302,6 +303,13 @@ AnchorControlState EeAnchorReferenceGovernor::step(
     }
 
     frozen_cycles_ = 0;
+    if (hold_reference)
+    {
+        // Joint limiting pauses reference advance, but never skips feedback
+        // monitoring or hides a persistent Cartesian tracking error above.
+        state_ = AnchorControlState::frozen;
+        return state_;
+    }
     state_ = AnchorControlState::tracking;
 
     double translation_step[3] = {

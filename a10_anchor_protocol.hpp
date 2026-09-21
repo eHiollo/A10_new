@@ -64,7 +64,8 @@ public:
     void release(const double actual_pm[16]);
     void force_fault(const double actual_pm[16]);
     AnchorControlState step(
-        const double user_target_pm[16], const double actual_pm[16], double dt_s);
+        const double user_target_pm[16], const double actual_pm[16], double dt_s,
+        bool hold_reference = false);
 
     AnchorControlState state() const { return state_; }
     bool control_active() const

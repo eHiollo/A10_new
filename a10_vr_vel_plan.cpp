@@ -19,6 +19,7 @@
 #include "a10_policy_tcp_plan.hpp"
 #include "a10_tcp_server.hpp"
 #include "a10_vr_joint_diagnostics.hpp"
+#include "a10_vr_joint_guard.hpp"
 #include "a10_vr_plan.hpp"
 
 extern A10TcpServer* g_tcp_server;
@@ -35,8 +36,8 @@ constexpr double k_trans_dz = 0.001;
 constexpr double k_rot_dz_rad = 0.2 * k_deg2rad;
 constexpr double k_max_trans_step = 0.03;
 constexpr double k_max_rot_step_rad = 1.8 * k_deg2rad;
-// Diagnostic thresholds mirror MotorConfig in kaanh.xml. They only label and
-// log anomalous IK output; they do not alter the command sent to the drives.
+// Diagnostic thresholds mirror MotorConfig in kaanh.xml. Anchor-mode joint
+// protection uses VrJointGuard independently of the diagnostic logging switch.
 constexpr std::array<double, k_joint_num> k_joint_max_velocity_rad_s = {
     2.6179938779914944,
     2.6179938779914944,
@@ -75,10 +76,8 @@ auto ee_motion(aris::plan::Plan& p) -> aris::dynamic::GeneralMotion&
 
 double wrap_near(double ref, double raw)
 {
-    double d = raw - ref;
-    while (d > M_PI) d -= 2.0 * M_PI;
-    while (d < -M_PI) d += 2.0 * M_PI;
-    return ref + d;
+    // remainder also terminates for non-finite IK output; the guard rejects it.
+    return ref + std::remainder(raw - ref, 2.0 * M_PI);
 }
 
 double vec3_norm(const double* v)
@@ -361,6 +360,11 @@ struct A10VrVelDriver::Imp
     std::int64_t previous_actual_count_{0};
     bool joint_diag_history_initialized_{false};
     bool joint_diag_enabled_{false};
+    VrJointGuard joint_guard_;
+    VrJointGuard::Result joint_guard_result_;
+    double raw_ik_joints[k_joint_num]{};
+    unsigned settled_cycles_{0};
+    bool reseed_ik_from_actual_{false};
 
     std::uint64_t consumed_ee_delta_seq_{0};
     std::uint64_t consumed_ee_anchor_seq_{0};
@@ -428,7 +432,10 @@ struct A10VrVelDriver::Imp
                "actual_r12,actual_y,actual_r20,actual_r21,actual_r22,actual_z,"
                "command_r00,command_r01,command_r02,command_x,command_r10,"
                "command_r11,command_r12,command_y,command_r20,command_r21,"
-               "command_r22,command_z\n";
+               "command_r22,command_z,joint_guard_limited,joint_guard_scale,"
+               "joint_guard_fault,joint_guard_joint";
+        for (int i = 1; i <= k_joint_num; ++i) plan.lout() << ",j" << i << "_q_ik_raw";
+        plan.lout() << "\n";
     }
 
     void log_joint_trace(
@@ -476,6 +483,9 @@ struct A10VrVelDriver::Imp
         constexpr int k_pose_indices[12] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
         for (int index : k_pose_indices) plan.lout() << "," << actual_pm[index];
         for (int index : k_pose_indices) plan.lout() << "," << command_pm[index];
+        plan.lout() << "," << joint_guard_result_.limited << "," << joint_guard_result_.scale
+                    << "," << joint_guard_result_.fault << "," << joint_guard_result_.joint;
+        for (double raw : raw_ik_joints) plan.lout() << "," << raw;
         plan.lout() << "\n";
     }
 
@@ -530,18 +540,33 @@ struct A10VrVelDriver::Imp
 
     void engage_anchor_control(const double actual_pm[16])
     {
+        // Re-anchor only at rest. A hardware/large following-error fault needs a
+        // plan restart; a new network anchor must not resume a stale joint target.
+        if (joint_guard_.faulted()) return;
+        if (settled_cycles_ < 25)
+        {
+            enter_anchor_fault(actual_pm, "reanchor_not_settled",
+                               anchor_shadow_.session_id(), anchor_shadow_.anchor_id());
+            return;
+        }
         anchor_fault_latched_ = false;
         anchor_fault_session_.clear();
         anchor_fault_id_ = 0;
         anchor_fault_reason_.clear();
         anchor_governor_.engage(actual_pm);
         std::memcpy(target_pm, actual_pm, sizeof(target_pm));
+        std::memcpy(command_pm, actual_pm, sizeof(command_pm));
+        zero_motion_state();
+        reseed_ik_from_actual_ = true;
+        // output_joints and its velocity history are NOT snapped to feedback:
+        // the small synchronization correction still passes through the guard.
         anchor_ik_fail_cycles_ = 0;
         idle_coast_ = false;
     }
 
     void release_anchor_control(const double actual_pm[16])
     {
+        if (joint_guard_.faulted()) return;
         anchor_fault_latched_ = false;
         anchor_fault_session_.clear();
         anchor_fault_id_ = 0;
@@ -570,6 +595,7 @@ struct A10VrVelDriver::Imp
 
     bool anchor_command_blocked_by_fault(const EeAnchorCommand& command) const
     {
+        if (joint_guard_.faulted()) return true;
         return anchor_fault_latched_ && command.active
             && command.session_id == anchor_fault_session_
             && command.anchor_id <= anchor_fault_id_;
@@ -592,6 +618,10 @@ auto A10VrVelDriver::prepareNrt() -> void
     imp_->anchor_fault_reason_.clear();
     imp_->anchor_ik_fail_cycles_ = 0;
     imp_->reset_joint_diagnostics();
+    imp_->joint_guard_.reset();
+    imp_->joint_guard_result_ = {};
+    imp_->settled_cycles_ = 0;
+    imp_->reseed_ik_from_actual_ = false;
     imp_->joint_diag_enabled_ = doubleParam("joint_diag") >= 0.5;
     if (imp_->joint_diag_enabled_)
     {
@@ -708,6 +738,7 @@ auto A10VrVelDriver::executeRT() -> int
                << " vmax=" << imp_->max_lin_vel_ << " wmax=" << imp_->max_ang_vel_
                << " amax=" << imp_->max_lin_acc_ << " jacc=" << imp_->max_ang_acc_
                << " joint_diag=" << (imp_->joint_diag_enabled_ ? "on" : "off")
+               << " joint_guard=" << (imp_->anchor_control_enabled_ ? "on" : "off")
                << " (default/off keeps SET_EE_DELTA arm control)" << std::endl;
         if (imp_->joint_diag_enabled_) imp_->write_joint_trace_header(*this);
     }
@@ -715,13 +746,23 @@ auto A10VrVelDriver::executeRT() -> int
     for (int i = 0; i < k_joint_num; ++i)
     {
         imp_->current_joints[i] = motors[k_motor_base + i].actualPos();
+        if (!std::isfinite(imp_->current_joints[i])
+            || (imp_->anchor_control_enabled_
+                && std::abs(imp_->current_joints[i]) > VrJointGuard::position_limit))
+        {
+            clear_vr_grip_cmd();
+            mout() << "vr_vel: invalid/out-of-range joint feedback; abort, joint=" << i + 1 << std::endl;
+            return -1;
+        }
     }
 
     double T_base_to_ee[16]{};
     arm.setInputPos(imp_->current_joints);
     if (arm.forwardKinematics())
     {
-        return count();
+        clear_vr_grip_cmd();
+        mout() << "vr_vel: actual FK failed; abort" << std::endl;
+        return -1;
     }
     ee.updP();
     ee.getMpm(T_base_to_ee);
@@ -732,6 +773,7 @@ auto A10VrVelDriver::executeRT() -> int
         std::memcpy(imp_->command_pm, T_base_to_ee, sizeof(imp_->command_pm));
         std::memcpy(imp_->output_joints, imp_->current_joints, sizeof(imp_->output_joints));
         std::memcpy(imp_->ik_joints, imp_->current_joints, sizeof(imp_->ik_joints));
+        std::memcpy(imp_->raw_ik_joints, imp_->current_joints, sizeof(imp_->raw_ik_joints));
         std::memcpy(
             imp_->previous_actual_joints,
             imp_->current_joints,
@@ -752,6 +794,22 @@ auto A10VrVelDriver::executeRT() -> int
         }
         mout() << "vr_vel: init ok (P velocity, target+=delta, tool-frame)" << std::endl;
         return 1;
+    }
+
+    if (imp_->anchor_control_enabled_)
+    {
+        VrJointGuard::Joints previous{}, velocity{}, actual{}, actual_velocity{};
+        const double actual_dt = (count() - imp_->previous_actual_count_) * k_dt;
+        for (int i = 0; i < k_joint_num; ++i)
+        {
+            previous[i] = imp_->output_joints[i];
+            velocity[i] = imp_->previous_joint_command_velocity[i];
+            actual[i] = imp_->current_joints[i];
+            actual_velocity[i] = (actual[i] - imp_->previous_actual_joints[i]) / actual_dt;
+        }
+        imp_->settled_cycles_ = VrJointGuard::ready_to_anchor(
+            previous, velocity, actual, actual_velocity)
+            ? std::min(25U, imp_->settled_cycles_ + 1) : 0;
     }
 
     EeAnchorCommand anchor_command;
@@ -810,6 +868,9 @@ auto A10VrVelDriver::executeRT() -> int
                    << " sample=" << imp_->anchor_shadow_.sample_sequence()
                    << (imp_->anchor_control_enabled_ ? " control=true" : " diagnostic_only=true")
                    << std::endl;
+            if (imp_->anchor_fault_reason_ == "reanchor_not_settled")
+                mout() << "vr_vel: anchor rejected while settling; release and re-anchor after stop"
+                       << std::endl;
         }
         else if (update_applied && update == AnchorShadowUpdate::inactive && anchor_was_active)
         {
@@ -875,8 +936,10 @@ auto A10VrVelDriver::executeRT() -> int
         if (imp_->anchor_governor_.control_active() && imp_->anchor_shadow_.active())
         {
             const AnchorControlState previous_state = imp_->anchor_governor_.state();
+            // Pause reference advance while the joint envelope is binding.
             const AnchorControlState state = imp_->anchor_governor_.step(
-                imp_->anchor_shadow_.user_target_pm().data(), T_base_to_ee, k_dt);
+                imp_->anchor_shadow_.user_target_pm().data(), T_base_to_ee, k_dt,
+                imp_->joint_guard_result_.limited);
             if (state == AnchorControlState::fault)
             {
                 if (imp_->enter_anchor_fault(
@@ -962,6 +1025,8 @@ auto A10VrVelDriver::executeRT() -> int
     slew_vec3(imp_->v_cmd_tool, v_target_tool, imp_->max_lin_acc_ * k_dt);
     slew_vec3(imp_->w_cmd_tool, w_target_tool, imp_->max_ang_acc_ * k_dt);
 
+    double previous_command_pm[16];
+    std::memcpy(previous_command_pm, imp_->command_pm, sizeof(previous_command_pm));
     integrate_tool_twist(imp_->command_pm, imp_->v_cmd_tool, imp_->w_cmd_tool, k_dt);
 
     if (count() % 250 == 0)
@@ -996,9 +1061,11 @@ auto A10VrVelDriver::executeRT() -> int
         }
     }
 
-    arm.setInputPos(imp_->output_joints);
+    arm.setInputPos(imp_->reseed_ik_from_actual_ ? imp_->current_joints : imp_->output_joints);
+    imp_->reseed_ik_from_actual_ = false;
     ee.setMpm(imp_->command_pm);
-    const bool ik_ok = !arm.inverseKinematics();
+    std::memcpy(imp_->raw_ik_joints, imp_->output_joints, sizeof(imp_->raw_ik_joints));
+    bool ik_ok = !arm.inverseKinematics();
     if (ik_ok)
     {
         imp_->anchor_ik_fail_cycles_ = 0;
@@ -1006,9 +1073,11 @@ auto A10VrVelDriver::executeRT() -> int
         for (int i = 0; i < k_joint_num; ++i)
         {
             imp_->ik_joints[i] = wrap_near(imp_->output_joints[i], imp_->ik_joints[i]);
+            if (!std::isfinite(imp_->ik_joints[i])) ik_ok = false;
         }
+        std::memcpy(imp_->raw_ik_joints, imp_->ik_joints, sizeof(imp_->raw_ik_joints));
     }
-    else
+    if (!ik_ok)
     {
         if (imp_->anchor_control_enabled_ && imp_->anchor_governor_.control_active())
         {
@@ -1032,6 +1101,54 @@ auto A10VrVelDriver::executeRT() -> int
                    << "m |e_rot|=" << vec3_norm(e_rot_tool) << "rad" << std::endl;
         }
         std::memcpy(imp_->ik_joints, imp_->output_joints, sizeof(imp_->ik_joints));
+    }
+
+    if (imp_->anchor_control_enabled_)
+    {
+        const bool previously_faulted = imp_->joint_guard_.faulted();
+        if (!ik_ok) imp_->joint_guard_.latch("joint_ik_failure");
+        VrJointGuard::Joints previous{}, velocity{}, requested{}, actual{};
+        for (int i = 0; i < k_joint_num; ++i)
+        {
+            previous[i] = imp_->output_joints[i];
+            velocity[i] = imp_->previous_joint_command_velocity[i];
+            requested[i] = imp_->ik_joints[i];
+            actual[i] = imp_->current_joints[i];
+        }
+        imp_->joint_guard_result_ = imp_->joint_guard_.step(previous, velocity, requested, actual);
+        std::copy(imp_->joint_guard_result_.position.begin(),
+                  imp_->joint_guard_result_.position.end(), imp_->ik_joints);
+        if (imp_->joint_guard_.faulted())
+        {
+            imp_->enter_anchor_fault(T_base_to_ee, imp_->joint_guard_.fault(),
+                                    imp_->anchor_shadow_.session_id(), imp_->anchor_shadow_.anchor_id());
+            clear_vr_grip_cmd();
+            if (!previously_faulted)
+                mout() << "vr_vel joint guard: " << imp_->joint_guard_.fault()
+                       << " joint=" << imp_->joint_guard_result_.joint
+                       << "; joint braking, stop/recover/restart vr_vel required" << std::endl;
+        }
+        // Accepted joint positions own command_pm. This prevents integrator
+        // windup and keeps the next IK seed on the trajectory actually sent.
+        arm.setInputPos(imp_->ik_joints);
+        if (arm.forwardKinematics())
+        {
+            clear_vr_grip_cmd();
+            mout() << "vr_vel: guarded command FK failed; abort" << std::endl;
+            return -1;
+        }
+        ee.updP();
+        ee.getMpm(imp_->command_pm);
+        if (imp_->joint_guard_result_.limited || imp_->joint_guard_.faulted())
+        {
+            pose_error_tool(imp_->command_pm, previous_command_pm,
+                            imp_->v_cmd_tool, imp_->w_cmd_tool);
+            for (int i = 0; i < 3; ++i)
+            {
+                imp_->v_cmd_tool[i] /= k_dt;
+                imp_->w_cmd_tool[i] /= k_dt;
+            }
+        }
     }
 
     std::array<JointDiagnosticResult, k_joint_num> joint_results{};
@@ -1076,7 +1193,7 @@ auto A10VrVelDriver::executeRT() -> int
     {
         imp_->log_joint_trace(*this, count(), ik_ok, joint_results, T_base_to_ee);
     }
-    if (ik_ok)
+    if (ik_ok || imp_->anchor_control_enabled_)
     {
         std::memcpy(imp_->output_joints, imp_->ik_joints, sizeof(imp_->output_joints));
     }
