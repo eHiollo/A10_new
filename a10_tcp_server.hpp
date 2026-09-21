@@ -49,6 +49,7 @@ public:
         std::uint64_t& out_seq,
         std::uint64_t consumed_seq);
     void clear_ee_anchor_target_nrt();
+    std::uint64_t ee_anchor_seq() const;
 
 private:
     void acceptLoop();
@@ -57,7 +58,7 @@ private:
     void send_policy_status(int client_sock);
     void send_leader_state(int client_sock);
     void send_follower_state(int client_sock);
-    void process_line(int client_sock, const std::string& line);
+    void process_line(int client_sock, const std::string& line, std::uint64_t receive_time_ns);
 
     int server_sockfd_;
     std::vector<int> client_sockfds_;

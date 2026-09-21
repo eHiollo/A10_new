@@ -336,6 +336,33 @@ void test_joint_limit_hold_keeps_tracking_monitor_live()
 
 int main()
 {
+    // Optional timing metadata must not silently accept invalid timestamps.
+    {
+        a10_tcp::EeAnchorCommand parsed;
+        std::string error;
+        assert(!a10_tcp::parse_ee_anchor_line(
+            "SET_EE_ANCHOR {\"active\":true,\"session_id\":\"timing\","
+            "\"anchor_id\":1,\"sample_sequence\":1,\"offset\":[0,0,0,0,0,0],"
+            "\"gripper\":0,\"client_sample_time_ns\":-1}", parsed, &error));
+        const std::string base = "SET_EE_ANCHOR {\"active\":true,\"session_id\":\"timing\","
+            "\"anchor_id\":1,\"sample_sequence\":1,\"offset\":[0,0,0,0.1,-0.2,0.3],\"gripper\":0";
+        assert(a10_tcp::parse_ee_anchor_line(base + ",\"client_sample_time_ns\":1234567890123456,"
+            "\"client_send_time_ns\":1234567891123456,\"robot_receive_time_ns\":99}", parsed, &error));
+        assert(parsed.has_client_sample_time && parsed.has_client_send_time);
+        assert(parsed.client_sample_time_ns == 1234567890123456ULL);
+        assert(parsed.client_send_time_ns == 1234567891123456ULL);
+        assert(parsed.robot_receive_time_ns == 0 && parsed.robot_publish_time_ns == 0);
+        expect_near(parsed.offset[4], -0.2);
+        assert(!a10_tcp::parse_ee_anchor_line(base + ",\"client_sample_time_ns\":2,\"client_send_time_ns\":1}", parsed, &error));
+        assert(!a10_tcp::parse_ee_anchor_line(base + ",\"client_send_time_ns\":1.5}", parsed, &error));
+        assert(!a10_tcp::parse_ee_anchor_line(base + ",\"client_send_time_ns\":\"123\"}", parsed, &error));
+        assert(a10_tcp::parse_ee_anchor_line(base + ",\"client_send_time_ns\":0}", parsed, &error));
+        assert(!parsed.has_client_sample_time && parsed.has_client_send_time);
+        // Reusing output for a legacy packet clears metadata from the last packet.
+        assert(a10_tcp::parse_ee_anchor_line(base + "}", parsed, &error));
+        assert(!parsed.has_client_sample_time && !parsed.has_client_send_time);
+        assert(parsed.client_sample_time_ns == 0 && parsed.client_send_time_ns == 0);
+    }
     test_protocol_parser();
     test_shadow_state_and_transform();
     test_reference_governor_limits_translation_and_rotation();

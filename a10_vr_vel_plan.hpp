@@ -10,6 +10,7 @@ namespace a10_tcp
 {
 /// VR P 速度遥操作：默认 ``SET_EE_DELTA``；A2.3 可显式切换为锚点 reference governor。
 /// 两种模式复用同一套 ``target → P/限速/slew → command → IK`` 控制链。
+/// ``reset`` 不退出本驱动，内部关节回到 ``m_init`` 初始位姿后重统一位姿跟踪。
 class A10VrVelDriver : public aris::core::CloneObject<A10VrVelDriver, aris::plan::Plan>
 {
 public:

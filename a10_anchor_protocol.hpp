@@ -2,6 +2,7 @@
 #define A10_ANCHOR_PROTOCOL_HPP_
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -15,7 +16,22 @@ struct EeAnchorCommand
     std::uint64_t sample_sequence{0};
     std::array<double, 6> offset{};
     double gripper{0.0};
+    // Optional sender monotonic timestamps, in one shared sender clock domain.
+    // Never subtract these from the robot's monotonic clock without clock sync.
+    bool has_client_sample_time{false};
+    bool has_client_send_time{false};
+    std::uint64_t client_sample_time_ns{0};
+    std::uint64_t client_send_time_ns{0};
+    // Set exclusively by the receiver, never accepted from JSON.
+    std::uint64_t robot_receive_time_ns{0};
+    std::uint64_t robot_publish_time_ns{0};
 };
+
+inline std::uint64_t anchor_monotonic_time_ns()
+{
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 
 bool parse_ee_anchor_line(
     const std::string& line, EeAnchorCommand& out, std::string* error = nullptr);
@@ -46,8 +62,8 @@ double effective_anchor_speed_limit(
 
 struct AnchorGovernorConfig
 {
-    double max_reference_linear_speed_m_s{0.06};
-    double max_reference_angular_speed_rad_s{0.25};
+    double max_reference_linear_speed_m_s{0.12};
+    double max_reference_angular_speed_rad_s{0.32};
     double max_tracking_error_m{0.05};
     double max_tracking_error_rad{0.35};
     std::uint32_t fault_after_frozen_cycles{50};

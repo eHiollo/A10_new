@@ -8,22 +8,38 @@
 namespace a10_tcp
 {
 // Joint-space envelope for the anchor driver. No SDK, allocation or I/O in step().
-// Limits mirror the first six MotorConfig entries in kaanh.xml; 5% margin
-// avoids commanding exactly at the drive's velocity/acceleration boundary.
+// Teleop limits are deliberately below the first six MotorConfig entries in
+// kaanh.xml. The Sep 21 trace reached 3.224 rad/s actual wrist speed with a
+// 2.985 rad/s command: the previous 5% margin did not cover servo overshoot.
 class VrJointGuard
 {
 public:
     using Joints = std::array<double, 6>;
     static constexpr double dt = 0.002;
-    static constexpr double acceleration = 0.95 * 17.453292519943293;
+    static constexpr double acceleration = 0.20 * 17.453292519943293; // 200 deg/s^2
     static constexpr double position_limit = 3.0543261909900763;
     static constexpr double following_limit = 0.10;
-    static constexpr unsigned limited_cycle_limit = 50;
+    // 500 ms allows the <=225 ms ramp from rest to the teleop speed cap.
+    // Only active demand counts; intentional braking must pass stop=true.
+    static constexpr unsigned limited_cycle_limit = 250;
 
     static double speed_limit(std::size_t i)
     {
-        return 0.95 * (i < 3 ? 2.6179938779914944 : 3.1415926535897931);
+        return 0.25 * (i < 3 ? 2.6179938779914944 : 3.1415926535897931);
     }
+
+    // Configure once before motion from MotorConfig, preserving asymmetric axes.
+    bool set_position_limits(const Joints& minimum, const Joints& maximum)
+    {
+        for (std::size_t i = 0; i < 6; ++i)
+            if (!std::isfinite(minimum[i]) || !std::isfinite(maximum[i])
+                || minimum[i] >= maximum[i]) return false;
+        minimum_ = minimum;
+        maximum_ = maximum;
+        return true;
+    }
+    double minimum(std::size_t i) const { return minimum_[i]; }
+    double maximum(std::size_t i) const { return maximum_[i]; }
 
     struct Result
     {
@@ -87,10 +103,10 @@ public:
             // Reserve the complete discrete braking distance before a joint limit.
             const double stopping_distance = std::abs(velocity[i]) * max_speed
                 / (2.0 * acceleration) + std::abs(velocity[i]) * dt;
-            const double available = position_limit
-                - std::copysign(1.0, velocity[i]) * previous[i];
-            if (std::abs(requested[i]) > position_limit
-                || std::abs(actual[i]) > position_limit
+            const double available = velocity[i] < 0.0
+                ? previous[i] - minimum_[i] : maximum_[i] - previous[i];
+            if (requested[i] < minimum_[i] || requested[i] > maximum_[i]
+                || actual[i] < minimum_[i] || actual[i] > maximum_[i]
                 || available <= stopping_distance + 0.002)
                 latch("joint_position_limit", static_cast<int>(i + 1));
 
@@ -129,6 +145,10 @@ public:
     }
 
 private:
+    Joints minimum_{{-position_limit, -position_limit, -position_limit,
+                     -position_limit, -position_limit, -position_limit}};
+    Joints maximum_{{position_limit, position_limit, position_limit,
+                     position_limit, position_limit, position_limit}};
     const char* fault_{"none"};
     int fault_joint_{0};
     unsigned limited_cycles_{0};

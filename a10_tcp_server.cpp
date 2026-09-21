@@ -122,6 +122,9 @@ void A10TcpServer::readerLoop(int client_sock)
         ssize_t n = ::recv(client_sock, tmp, sizeof(tmp), 0);
         if (n > 0)
         {
+            // Completion time of the recv containing the line's final newline.
+            // All lines in one recv share this timestamp, exposing batch delivery.
+            const auto receive_time_ns = a10_tcp::anchor_monotonic_time_ns();
             buffer.append(tmp, tmp + n);
             size_t pos;
             // 当接收的数据出现“/n”时，表示一行数据接收完毕，转入process_line处理
@@ -129,7 +132,7 @@ void A10TcpServer::readerLoop(int client_sock)
             {
                 std::string line = buffer.substr(0, pos);
                 buffer.erase(0, pos + 1);
-                process_line(client_sock, line);
+                process_line(client_sock, line, receive_time_ns);
             }
         }
         else
@@ -308,6 +311,11 @@ void A10TcpServer::clear_ee_anchor_target_nrt()
     target_ee_anchor_ = a10_tcp::EeAnchorCommand{};
 }
 
+std::uint64_t A10TcpServer::ee_anchor_seq() const
+{
+    return ee_anchor_seq_.load(std::memory_order_acquire);
+}
+
 bool A10TcpServer::fetch_ee_anchor_if_updated(
     a10_tcp::EeAnchorCommand& out,
     std::uint64_t& out_seq,
@@ -442,7 +450,8 @@ void A10TcpServer::send_follower_state(int client_sock)
     }
 }
 
-void A10TcpServer::process_line(int client_sock, const std::string &line)
+void A10TcpServer::process_line(
+    int client_sock, const std::string &line, std::uint64_t receive_time_ns)
 {
     // 响应“”GET_LEADER_STATE”请求
     if (line.find("GET_LEADER_STATE") != std::string::npos)
@@ -476,6 +485,8 @@ void A10TcpServer::process_line(int client_sock, const std::string &line)
         }
         {
             std::lock_guard<std::mutex> lk(ee_anchor_mutex_);
+            command.robot_receive_time_ns = receive_time_ns;
+            command.robot_publish_time_ns = a10_tcp::anchor_monotonic_time_ns();
             target_ee_anchor_ = std::move(command);
             has_ee_anchor_ = true;
             (void)ee_anchor_seq_.fetch_add(1, std::memory_order_acq_rel);

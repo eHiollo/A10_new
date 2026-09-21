@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
+#include <iostream>
+#include <utility>
 #include <vector>
 
 #include <rtb.hpp>
@@ -18,15 +21,49 @@ extern A10TcpServer* g_tcp_server;
 namespace a10_tcp
 {
 std::atomic<bool> g_a10_vr_stop_requested{false};
+std::atomic<bool> g_a10_vr_init_requested{false};
 
 void request_vr_teleop_stop()
 {
     g_a10_vr_stop_requested.store(true, std::memory_order_release);
+    g_a10_vr_init_requested.store(false, std::memory_order_release);
     clear_vr_grip_cmd();
     if (g_tcp_server != nullptr)
     {
         g_tcp_server->clear_ee_delta_target_nrt();
+        g_tcp_server->clear_ee_anchor_target_nrt();
     }
+}
+
+void request_vr_init()
+{
+    g_a10_vr_init_requested.store(true, std::memory_order_release);
+    clear_vr_grip_cmd();
+    request_gripper_position_mm(k_gripper_mm_min);
+    if (g_tcp_server != nullptr)
+    {
+        g_tcp_server->clear_ee_delta_target_nrt();
+        g_tcp_server->clear_ee_anchor_target_nrt();
+    }
+}
+
+A10VrResetModule::A10VrResetModule()
+{
+    setName("VrReset");
+}
+
+auto A10VrResetModule::execute(
+    const std::string& str, std::function<void(std::string)> send_ret) noexcept
+    -> std::pair<std::string, std::string>
+{
+    if (getCmdName(str) != "reset")
+    {
+        return {str, ""};
+    }
+    request_vr_init();
+    sendRet(send_ret, 0, "reset requested");
+    std::cout << "reset: requested, vr_vel RT will home" << std::endl;
+    END_CMD_FLOW;
 }
 
 namespace
@@ -443,10 +480,36 @@ A10VrCliStop::A10VrCliStop(const std::string& name)
 
 A10VrCliStop::~A10VrCliStop() = default;
 KAANH_DEFINE_BIG_FOUR_CPP(A10VrCliStop)
+
+auto A10VrCliInit::prepareNrt() -> void
+{
+    for (auto& m : motorOptions())
+    {
+        m = aris::plan::Plan::CHECK_NONE | aris::plan::Plan::NOT_CHECK_POS_CONTINUOUS_SECOND_ORDER;
+    }
+    request_vr_init();
+    mout() << "reset: requested" << std::endl;
+    option() |= NOT_RUN_EXECUTE_FUNCTION;
+}
+
+auto A10VrCliInit::executeRT() -> int
+{
+    return 0;
+}
+
+A10VrCliInit::A10VrCliInit(const std::string& name)
+{
+    (void)name;
+    aris::core::fromXmlString(command(), "<Command name=\"reset\"/>");
+}
+
+A10VrCliInit::~A10VrCliInit() = default;
+KAANH_DEFINE_BIG_FOUR_CPP(A10VrCliInit)
 }  // namespace a10_tcp
 
 ARIS_REGISTRATION
 {
     aris::core::class_<a10_tcp::A10VrDriver>("A10VrDriver").inherit<aris::plan::Plan>();
     aris::core::class_<a10_tcp::A10VrCliStop>("A10VrCliStop").inherit<aris::plan::Plan>();
+    aris::core::class_<a10_tcp::A10VrCliInit>("A10VrCliInit").inherit<aris::plan::Plan>();
 }

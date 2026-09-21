@@ -434,6 +434,16 @@ bool parse_ee_anchor_line(const std::string& line, EeAnchorCommand& out, std::st
         {
             return fail(error, "gripper must be finite");
         }
+        parsed.has_client_sample_time = object.contains("client_sample_time_ns");
+        parsed.has_client_send_time = object.contains("client_send_time_ns");
+        if ((parsed.has_client_sample_time && !parse_nonnegative_u64(
+                object, "client_sample_time_ns", parsed.client_sample_time_ns, error))
+            || (parsed.has_client_send_time && !parse_nonnegative_u64(
+                object, "client_send_time_ns", parsed.client_send_time_ns, error)))
+            return false;
+        if (parsed.has_client_sample_time && parsed.has_client_send_time
+            && parsed.client_send_time_ns < parsed.client_sample_time_ns)
+            return fail(error, "client_send_time_ns must not precede client_sample_time_ns");
         out = std::move(parsed);
         if (error != nullptr)
         {

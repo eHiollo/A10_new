@@ -482,7 +482,7 @@
                     <EcMotIndex name="error_code" index="0x603f" sub_index="0x00"/>
                 </EcMotIndexVec>
             </MotorConfig>
-            <MotorConfig max_pos="3.0543261909900763" min_pos="-3.0543261909900763" max_vel="3.14159265358979312" min_vel="-3.14159265358979312" max_acc="17.45329251994329312" min_acc="-17.45329251994329312" max_pos_following_error="0.52359877559829882" max_vel_following_error="0.26179938779914941" pos_factor="83443.02680349226284306" pos_offset="3.14154471670038804" home_pos="0" vel_factor="0.01" enable_waiting_count="10" slave="3" feed_constant="360" gear_ratio="1" resolution="524288" direction="1" motion_type="rotatory">
+            <MotorConfig max_pos="3.0543261909900763" min_pos="-4.3633231299858239" max_vel="3.14159265358979312" min_vel="-3.14159265358979312" max_acc="17.45329251994329312" min_acc="-17.45329251994329312" max_pos_following_error="0.52359877559829882" max_vel_following_error="0.26179938779914941" pos_factor="83443.02680349226284306" pos_offset="3.14154471670038804" home_pos="0" vel_factor="0.01" enable_waiting_count="10" slave="3" feed_constant="360" gear_ratio="1" resolution="524288" direction="1" motion_type="rotatory">
                 <EcMotIndexVec __prop_name__="ec_index">
                     <EcMotIndex name="control_word" index="0x6040" sub_index="0x00"/>
                     <EcMotIndex name="mode_of_operation" index="0x6060" sub_index="0x00"/>
@@ -1669,30 +1669,34 @@
             <A10VrVelDriver name="plan">
                 <Command __prop_name__="command" name="vr_vel">
                     <GroupParam name="group_param">
-                        <Param name="kp" abbreviation="p" default="3.0"/>
-                        <Param name="kp_rot" abbreviation="r" default="2.0"/>
+                        <Param name="kp" abbreviation="p" default="6.0"/>
+                        <Param name="kp_rot" abbreviation="r" default="4.8"/>
                         <Param name="vmax" abbreviation="v" default="0.12"/>
-                        <Param name="wmax" abbreviation="w" default="0.4"/>
-                        <Param name="amax" abbreviation="a" default="0.8"/>
-                        <Param name="jacc" abbreviation="j" default="1.5"/>
+                        <Param name="wmax" abbreviation="w" default="0.32"/>
+                        <Param name="amax" abbreviation="a" default="0.4"/>
+                        <Param name="jacc" abbreviation="j" default="0.96"/>
                         <Param name="pull" abbreviation="l" default="0.995"/>
                         <Param name="rot_gain" abbreviation="g" default="1.0"/>
                         <Param name="timeout" abbreviation="t" default="0.12"/>
                         <Param name="grip_vel" abbreviation="h" default="50"/>
-                        <Param name="anchor_control" abbreviation="c" default="0"/>
-                        <Param name="ref_vmax" abbreviation="u" default="0.06"/>
-                        <Param name="ref_wmax" abbreviation="o" default="0.25"/>
+                        <Param name="anchor_control" abbreviation="c" default="1"/>
+                        <Param name="ref_vmax" abbreviation="u" default="0.12"/>
+                        <Param name="ref_wmax" abbreviation="o" default="0.32"/>
                         <Param name="track_pos" abbreviation="e" default="0.05"/>
                         <Param name="track_rot" abbreviation="d" default="0.35"/>
                         <Param name="track_fault_cycles" abbreviation="f" default="50"/>
                         <Param name="anchor_timeout" abbreviation="s" default="0.25"/>
                         <Param name="ik_fault_cycles" abbreviation="i" default="5"/>
+                        <Param name="joint_diag" abbreviation="q" default="1"/>
                     </GroupParam>
                 </Command>
             </A10VrVelDriver>
             <A10VrCliStop name="plan">
                 <Command __prop_name__="command" name="stop_teleop"/>
             </A10VrCliStop>
+            <A10VrCliInit name="plan">
+                <Command __prop_name__="command" name="reset"/>
+            </A10VrCliInit>
             <A10GripperOpen name="plan">
                 <Command __prop_name__="command" name="g_open"/>
             </A10GripperOpen>
