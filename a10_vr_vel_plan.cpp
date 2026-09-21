@@ -358,12 +358,9 @@ struct A10VrVelDriver::Imp
     double previous_actual_joints[k_joint_num]{};
     bool joint_diag_active[k_joint_num]{};
     std::uint32_t joint_diag_last_flags[k_joint_num]{};
-    std::int64_t joint_diag_last_log_count[k_joint_num]{};
     std::int64_t previous_actual_count_{0};
     bool joint_diag_history_initialized_{false};
-    bool joint_diag_enabled_{true};
-    std::uint32_t joint_diag_repeat_cycles_{50};
-    std::uint64_t joint_diag_event_sequence_{0};
+    bool joint_diag_enabled_{false};
 
     std::uint64_t consumed_ee_delta_seq_{0};
     std::uint64_t consumed_ee_anchor_seq_{0};
@@ -400,22 +397,33 @@ struct A10VrVelDriver::Imp
         std::fill_n(previous_actual_joints, k_joint_num, 0.0);
         std::fill_n(joint_diag_active, k_joint_num, false);
         std::fill_n(joint_diag_last_flags, k_joint_num, joint_diag_none);
-        std::fill_n(joint_diag_last_log_count, k_joint_num, 0);
         previous_actual_count_ = 0;
         joint_diag_history_initialized_ = false;
-        joint_diag_event_sequence_ = 0;
     }
 
-    void write_joint_diagnostic_header(aris::plan::Plan& plan)
+    void write_joint_trace_header(aris::plan::Plan& plan)
     {
         plan.lout()
-            << "VR_JOINT_DIAG_HEADER,event_seq,count,joint,flags,q_prev,q_next,dq,"
-               "qdot_cmd,qddot_cmd,q_actual,q_actual_prev,actual_dt,qdot_actual,follow_error,"
-               "vmax,amax,follow_max,anchor_control,anchor_active,anchor_state,"
-               "anchor_id,sample_sequence,track_pos,track_rot,fault,session_id,"
-               "q_prev_j1,q_prev_j2,q_prev_j3,q_prev_j4,q_prev_j5,q_prev_j6,"
-               "q_next_j1,q_next_j2,q_next_j3,q_next_j4,q_next_j5,q_next_j6,"
-               "q_actual_j1,q_actual_j2,q_actual_j3,q_actual_j4,q_actual_j5,q_actual_j6,"
+            << "VR_JOINT_TRACE_HEADER,count,ik_ok,anchor_control,anchor_active,anchor_state,"
+               "anchor_id,sample_sequence,track_pos,track_rot,fault,session_id,actual_dt,"
+               "v_cmd_x,v_cmd_y,v_cmd_z,w_cmd_x,w_cmd_y,w_cmd_z,"
+               "reference_x,reference_y,reference_z,user_target_x,user_target_y,user_target_z";
+        for (int joint = 0; joint < k_joint_num; ++joint)
+        {
+            const int number = joint + 1;
+            plan.lout() << ",j" << number << "_q_prev"
+                        << ",j" << number << "_q_next"
+                        << ",j" << number << "_dq"
+                        << ",j" << number << "_qdot_cmd"
+                        << ",j" << number << "_qddot_cmd"
+                        << ",j" << number << "_q_actual"
+                        << ",j" << number << "_q_actual_prev"
+                        << ",j" << number << "_qdot_actual"
+                        << ",j" << number << "_follow_error"
+                        << ",j" << number << "_flags";
+        }
+        plan.lout()
+            << ","
                "actual_r00,actual_r01,actual_r02,actual_x,actual_r10,actual_r11,"
                "actual_r12,actual_y,actual_r20,actual_r21,actual_r22,actual_z,"
                "command_r00,command_r01,command_r02,command_x,command_r10,"
@@ -423,62 +431,69 @@ struct A10VrVelDriver::Imp
                "command_r22,command_z\n";
     }
 
-    void log_joint_diagnostic(
+    void log_joint_trace(
         aris::plan::Plan& plan,
         std::int64_t control_count,
-        int joint,
-        const JointDiagnosticResult& result,
-        const double actual_pm[16],
-        bool print_summary)
+        bool ik_ok,
+        const std::array<JointDiagnosticResult, k_joint_num>& results,
+        const double actual_pm[16])
     {
-        ++joint_diag_event_sequence_;
         const char* state = anchor_control_state_name(anchor_governor_.state());
         const char* fault = anchor_fault_reason_.empty() ? "none" : anchor_fault_reason_.c_str();
         const std::uint64_t anchor_id = anchor_shadow_.active() ? anchor_shadow_.anchor_id() : 0;
         const std::uint64_t sample_sequence =
             anchor_shadow_.active() ? anchor_shadow_.sample_sequence() : 0;
+        const auto& reference = anchor_governor_.reference_pm();
+        const auto& user_target = anchor_shadow_.user_target_pm();
 
-        plan.lout() << std::setprecision(15)
-                    << "VR_JOINT_DIAG," << joint_diag_event_sequence_ << "," << control_count
-                    << "," << (joint + 1) << "," << result.flags
-                    << "," << output_joints[joint] << "," << ik_joints[joint]
-                    << "," << result.command_delta_rad
-                    << "," << result.command_velocity_rad_s
-                    << "," << result.command_acceleration_rad_s2
-                    << "," << current_joints[joint]
-                    << "," << previous_actual_joints[joint]
-                    << "," << (control_count - previous_actual_count_) * k_dt
-                    << "," << result.actual_velocity_rad_s
-                    << "," << result.following_error_rad
-                    << "," << k_joint_max_velocity_rad_s[static_cast<std::size_t>(joint)]
-                    << "," << k_joint_max_acceleration_rad_s2[static_cast<std::size_t>(joint)]
-                    << "," << k_joint_max_following_error_rad[static_cast<std::size_t>(joint)]
+        plan.lout() << std::setprecision(10)
+                    << "VR_JOINT_TRACE," << control_count << "," << (ik_ok ? 1 : 0)
                     << "," << (anchor_control_enabled_ ? 1 : 0)
                     << "," << (anchor_shadow_.active() ? 1 : 0)
                     << "," << state << "," << anchor_id << "," << sample_sequence
                     << "," << anchor_governor_.tracking_error_m()
                     << "," << anchor_governor_.tracking_error_rad()
-                    << "," << fault << "," << anchor_shadow_.session_id();
-        for (double q : output_joints) plan.lout() << "," << q;
-        for (double q : ik_joints) plan.lout() << "," << q;
-        for (double q : current_joints) plan.lout() << "," << q;
+                    << "," << fault << "," << anchor_shadow_.session_id()
+                    << "," << (control_count - previous_actual_count_) * k_dt
+                    << "," << v_cmd_tool[0] << "," << v_cmd_tool[1] << "," << v_cmd_tool[2]
+                    << "," << w_cmd_tool[0] << "," << w_cmd_tool[1] << "," << w_cmd_tool[2]
+                    << "," << reference[3] << "," << reference[7] << "," << reference[11]
+                    << "," << user_target[3] << "," << user_target[7] << "," << user_target[11];
+        for (int joint = 0; joint < k_joint_num; ++joint)
+        {
+            const auto& result = results[static_cast<std::size_t>(joint)];
+            plan.lout() << "," << output_joints[joint]
+                        << "," << ik_joints[joint]
+                        << "," << result.command_delta_rad
+                        << "," << result.command_velocity_rad_s
+                        << "," << result.command_acceleration_rad_s2
+                        << "," << current_joints[joint]
+                        << "," << previous_actual_joints[joint]
+                        << "," << result.actual_velocity_rad_s
+                        << "," << result.following_error_rad
+                        << "," << result.flags;
+        }
         constexpr int k_pose_indices[12] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
         for (int index : k_pose_indices) plan.lout() << "," << actual_pm[index];
         for (int index : k_pose_indices) plan.lout() << "," << command_pm[index];
         plan.lout() << "\n";
+    }
 
-        if (print_summary)
-        {
-            plan.mout() << "vr_vel joint_diag: event=" << joint_diag_event_sequence_
-                        << " joint=" << (joint + 1) << " flags=" << result.flags
-                        << " q_prev=" << output_joints[joint]
-                        << " q_next=" << ik_joints[joint]
-                        << " qdot=" << result.command_velocity_rad_s
-                        << " qddot=" << result.command_acceleration_rad_s2
-                        << " q_actual=" << current_joints[joint]
-                        << " anchor_state=" << state << " anchor=" << anchor_id
-                        << " sample=" << sample_sequence << std::endl;
-        }
+    void print_joint_diagnostic_summary(
+        aris::plan::Plan& plan, int joint, const JointDiagnosticResult& result)
+    {
+        plan.mout() << "vr_vel joint_diag: joint=" << (joint + 1)
+                    << " flags=" << result.flags
+                    << " q_prev=" << output_joints[joint]
+                    << " q_next=" << ik_joints[joint]
+                    << " qdot=" << result.command_velocity_rad_s
+                    << " qddot=" << result.command_acceleration_rad_s2
+                    << " q_actual=" << current_joints[joint]
+                    << " anchor_state=" << anchor_control_state_name(anchor_governor_.state())
+                    << " anchor=" << (anchor_shadow_.active() ? anchor_shadow_.anchor_id() : 0)
+                    << " sample="
+                    << (anchor_shadow_.active() ? anchor_shadow_.sample_sequence() : 0)
+                    << std::endl;
     }
 
     void apply_joints_to_motors(aris::plan::Plan& plan)
@@ -578,17 +593,12 @@ auto A10VrVelDriver::prepareNrt() -> void
     imp_->anchor_ik_fail_cycles_ = 0;
     imp_->reset_joint_diagnostics();
     imp_->joint_diag_enabled_ = doubleParam("joint_diag") >= 0.5;
-    if (doubleParam("joint_diag_repeat") > 0.0)
-    {
-        imp_->joint_diag_repeat_cycles_ = static_cast<std::uint32_t>(std::max(
-            1.0, std::round(doubleParam("joint_diag_repeat") / k_dt)));
-    }
     if (imp_->joint_diag_enabled_)
     {
-        const std::string log_name = std::string("vr_joint_diag_")
+        const std::string log_name = std::string("vr_joint_trace_")
             + aris::core::logFileTimeFormat(std::chrono::system_clock::now());
         master()->logFileRawName(log_name.c_str());
-        std::cout << "vr_vel joint_diag log: " << log_name << std::endl;
+        std::cout << "vr_vel joint trace log: " << log_name << std::endl;
     }
     imp_->zero_motion_state();
     g_a10_vr_stop_requested.store(false, std::memory_order_release);
@@ -698,9 +708,8 @@ auto A10VrVelDriver::executeRT() -> int
                << " vmax=" << imp_->max_lin_vel_ << " wmax=" << imp_->max_ang_vel_
                << " amax=" << imp_->max_lin_acc_ << " jacc=" << imp_->max_ang_acc_
                << " joint_diag=" << (imp_->joint_diag_enabled_ ? "on" : "off")
-               << " joint_diag_repeat=" << imp_->joint_diag_repeat_cycles_ * k_dt
                << " (default/off keeps SET_EE_DELTA arm control)" << std::endl;
-        if (imp_->joint_diag_enabled_) imp_->write_joint_diagnostic_header(*this);
+        if (imp_->joint_diag_enabled_) imp_->write_joint_trace_header(*this);
     }
 
     for (int i = 0; i < k_joint_num; ++i)
@@ -736,6 +745,11 @@ auto A10VrVelDriver::executeRT() -> int
         imp_->last_anchor_packet_count_ = count();
         sync_vr_grip_target_from_actual(g_vr_grip_actual_mm.load(std::memory_order_acquire));
         imp_->inited_ = true;
+        if (imp_->joint_diag_enabled_)
+        {
+            const std::array<JointDiagnosticResult, k_joint_num> initial_results{};
+            imp_->log_joint_trace(*this, count(), true, initial_results, T_base_to_ee);
+        }
         mout() << "vr_vel: init ok (P velocity, target+=delta, tool-frame)" << std::endl;
         return 1;
     }
@@ -984,57 +998,15 @@ auto A10VrVelDriver::executeRT() -> int
 
     arm.setInputPos(imp_->output_joints);
     ee.setMpm(imp_->command_pm);
-    if (!arm.inverseKinematics())
+    const bool ik_ok = !arm.inverseKinematics();
+    if (ik_ok)
     {
         imp_->anchor_ik_fail_cycles_ = 0;
         arm.getInputPos(imp_->ik_joints);
         for (int i = 0; i < k_joint_num; ++i)
         {
             imp_->ik_joints[i] = wrap_near(imp_->output_joints[i], imp_->ik_joints[i]);
-            JointDiagnosticInput input;
-            input.previous_command_position_rad = imp_->output_joints[i];
-            input.command_position_rad = imp_->ik_joints[i];
-            input.previous_command_velocity_rad_s = imp_->previous_joint_command_velocity[i];
-            input.actual_position_rad = imp_->current_joints[i];
-            input.previous_actual_position_rad = imp_->previous_actual_joints[i];
-            input.actual_sample_dt_s =
-                static_cast<double>(count() - imp_->previous_actual_count_) * k_dt;
-            input.has_previous_command_velocity = imp_->joint_diag_history_initialized_;
-            input.has_previous_actual_position = imp_->joint_diag_history_initialized_;
-            const JointDiagnosticLimits limits{
-                k_joint_max_velocity_rad_s[static_cast<std::size_t>(i)],
-                k_joint_max_acceleration_rad_s2[static_cast<std::size_t>(i)],
-                k_joint_max_following_error_rad[static_cast<std::size_t>(i)],
-            };
-            const JointDiagnosticResult result = evaluate_joint_diagnostic(input, limits, k_dt);
-            if (imp_->joint_diag_enabled_ && result.abnormal())
-            {
-                const bool first_abnormal_cycle = !imp_->joint_diag_active[i];
-                const bool new_flag =
-                    (result.flags & ~imp_->joint_diag_last_flags[i]) != joint_diag_none;
-                const bool repeat_due =
-                    count() - imp_->joint_diag_last_log_count[i]
-                    >= static_cast<std::int64_t>(imp_->joint_diag_repeat_cycles_);
-                if (first_abnormal_cycle || new_flag || repeat_due)
-                {
-                    imp_->log_joint_diagnostic(
-                        *this,
-                        count(),
-                        i,
-                        result,
-                        T_base_to_ee,
-                        first_abnormal_cycle || new_flag);
-                    imp_->joint_diag_last_log_count[i] = count();
-                }
-            }
-            imp_->joint_diag_active[i] = result.abnormal();
-            imp_->joint_diag_last_flags[i] = result.flags;
-            imp_->previous_joint_command_velocity[i] =
-                std::isfinite(result.command_velocity_rad_s)
-                ? result.command_velocity_rad_s
-                : 0.0;
         }
-        std::memcpy(imp_->output_joints, imp_->ik_joints, sizeof(imp_->output_joints));
     }
     else
     {
@@ -1059,9 +1031,54 @@ auto A10VrVelDriver::executeRT() -> int
             mout() << "vr_vel: IK fail, |e_pos|=" << vec3_norm(e_pos_tool)
                    << "m |e_rot|=" << vec3_norm(e_rot_tool) << "rad" << std::endl;
         }
-        std::fill_n(imp_->previous_joint_command_velocity, k_joint_num, 0.0);
-        std::fill_n(imp_->joint_diag_active, k_joint_num, false);
-        std::fill_n(imp_->joint_diag_last_flags, k_joint_num, joint_diag_none);
+        std::memcpy(imp_->ik_joints, imp_->output_joints, sizeof(imp_->ik_joints));
+    }
+
+    std::array<JointDiagnosticResult, k_joint_num> joint_results{};
+    for (int i = 0; i < k_joint_num; ++i)
+    {
+        JointDiagnosticInput input;
+        input.previous_command_position_rad = imp_->output_joints[i];
+        input.command_position_rad = imp_->ik_joints[i];
+        input.previous_command_velocity_rad_s = imp_->previous_joint_command_velocity[i];
+        input.actual_position_rad = imp_->current_joints[i];
+        input.previous_actual_position_rad = imp_->previous_actual_joints[i];
+        input.actual_sample_dt_s =
+            static_cast<double>(count() - imp_->previous_actual_count_) * k_dt;
+        input.has_previous_command_velocity = imp_->joint_diag_history_initialized_;
+        input.has_previous_actual_position = imp_->joint_diag_history_initialized_;
+        const JointDiagnosticLimits limits{
+            k_joint_max_velocity_rad_s[static_cast<std::size_t>(i)],
+            k_joint_max_acceleration_rad_s2[static_cast<std::size_t>(i)],
+            k_joint_max_following_error_rad[static_cast<std::size_t>(i)],
+        };
+        auto& result = joint_results[static_cast<std::size_t>(i)];
+        result = evaluate_joint_diagnostic(input, limits, k_dt);
+        if (imp_->joint_diag_enabled_ && result.abnormal())
+        {
+            const bool first_abnormal_cycle = !imp_->joint_diag_active[i];
+            const bool new_flag =
+                (result.flags & ~imp_->joint_diag_last_flags[i]) != joint_diag_none;
+            if (first_abnormal_cycle || new_flag)
+            {
+                imp_->print_joint_diagnostic_summary(*this, i, result);
+            }
+        }
+        imp_->joint_diag_active[i] = result.abnormal();
+        imp_->joint_diag_last_flags[i] = result.flags;
+        imp_->previous_joint_command_velocity[i] =
+            std::isfinite(result.command_velocity_rad_s)
+            ? result.command_velocity_rad_s
+            : 0.0;
+    }
+
+    if (imp_->joint_diag_enabled_)
+    {
+        imp_->log_joint_trace(*this, count(), ik_ok, joint_results, T_base_to_ee);
+    }
+    if (ik_ok)
+    {
+        std::memcpy(imp_->output_joints, imp_->ik_joints, sizeof(imp_->output_joints));
     }
 
     std::memcpy(
@@ -1099,8 +1116,7 @@ A10VrVelDriver::A10VrVelDriver(const std::string& name) : imp_(new Imp)
         "    <Param name=\"track_fault_cycles\" abbreviation=\"f\" default=\"50\"/>"
         "    <Param name=\"anchor_timeout\" abbreviation=\"s\" default=\"0.25\"/>"
         "    <Param name=\"ik_fault_cycles\" abbreviation=\"i\" default=\"5\"/>"
-        "    <Param name=\"joint_diag\" abbreviation=\"q\" default=\"1\"/>"
-        "    <Param name=\"joint_diag_repeat\" abbreviation=\"b\" default=\"0.10\"/>"
+        "    <Param name=\"joint_diag\" abbreviation=\"q\" default=\"0\"/>"
         "  </GroupParam>"
         "</Command>");
 }
