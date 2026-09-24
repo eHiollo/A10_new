@@ -1,4 +1,5 @@
 #include "a10_anchor_protocol.hpp"
+#include "a10_vr_reset_command.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -363,6 +364,11 @@ int main()
         assert(!parsed.has_client_sample_time && !parsed.has_client_send_time);
         assert(parsed.client_sample_time_ns == 0 && parsed.client_send_time_ns == 0);
     }
+    assert(a10_tcp::is_vr_reset_command("reset"));
+    assert(a10_tcp::is_vr_reset_command("RESET"));
+    assert(a10_tcp::is_vr_reset_command("  Reset\r"));
+    assert(!a10_tcp::is_vr_reset_command("reset now"));
+    assert(!a10_tcp::is_vr_reset_command("SET_EE_DELTA {\"actions\":[0,0,0,0,0,0,0]}"));
     test_protocol_parser();
     test_shadow_state_and_transform();
     test_reference_governor_limits_translation_and_rotation();
