@@ -509,6 +509,8 @@ KAANH_DEFINE_BIG_FOUR_CPP(A10VrCliInit)
 
 ARIS_REGISTRATION
 {
+    aris::core::class_<a10_tcp::A10VrResetModule>("A10VrResetModule")
+        .inherit<kaanh::module::MiddleModule>();
     aris::core::class_<a10_tcp::A10VrDriver>("A10VrDriver").inherit<aris::plan::Plan>();
     aris::core::class_<a10_tcp::A10VrCliStop>("A10VrCliStop").inherit<aris::plan::Plan>();
     aris::core::class_<a10_tcp::A10VrCliInit>("A10VrCliInit").inherit<aris::plan::Plan>();

@@ -11,7 +11,6 @@
 #include "kaanh/general/version.hpp"
 #include "kaanhbot/system/version.hpp"
 #include "kaanhbot/system/about.hpp"
-#include "kaanhbot/utility/tool_api.hpp"
 #include "plan.hpp"
 #include "a10_gripper_bridge.hpp"
 #include "a10_tcp_server.hpp"
@@ -154,7 +153,8 @@ int main(int argc, char *argv[]){
     });
     state_update_thread.detach();
 
-    // 修改末端杆件位姿,需要重写xml
+    // 修改末端杆件位姿。这里只调整当前进程中的模型，不回写部署配置；
+    // 启动时覆盖 kaanh.xml 会在序列化失败或进程中断时留下空文件。
    {
        auto& multimodel = dynamic_cast<aris::dynamic::MultiModel&>(cs.model());
        if (multimodel.subModels().empty())
@@ -209,11 +209,6 @@ int main(int argc, char *argv[]){
 
         }
         else{}
-        try {
-            kaanhbot::utility::saveCs();
-        } catch (const std::exception& e) {
-            std::cerr << "startup: saveCs skipped (" << e.what() << ")" << std::endl;
-        }
        }
    }
 	// 重载Aris log接口
