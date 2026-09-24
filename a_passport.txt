@@ -1,4 +1,4 @@
-login --user=Manufacturer --pwd=584b98aac2dddf59ee2cf19ca4ccb75e
+login --user=Manufacturer --pwd=a96d3afec184766bfeca7a9f989fc7e7
 机械臂CLI指令
     #回到初始姿态
         m_init -p=0/1/2/3/4
@@ -16,8 +16,11 @@ python run_bridge.py \
   --robot-host 127.0.0.1 --robot-port 8080 \
   --hz 10
 
-# 启动vr控制
-vr_vel --anchor_control=1 --ref_vmax=0.06 --ref_wmax=0.2
+# 启动vr控制（平移保持原值，旋转为上一组好用参数的 80%）
+# vr_vel --anchor_control=1 --kp=6 --vmax=0.12 --ref_vmax=0.12 --amax=0.4 --kp_rot=4.8 --wmax=0.32 --ref_wmax=0.32 --jacc=0.96 --joint_diag=1
+vr_vel
+# vr_vel 运行中复位到 m_init preset 0（不退出 vr_vel）
+reset
 
 # 编译
 cd /build

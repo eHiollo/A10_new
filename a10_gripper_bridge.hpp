@@ -13,7 +13,7 @@ constexpr std::uint8_t k_gripper_servo_id = 10;
 constexpr char k_gripper_type[] = "100mm";
 constexpr std::uint16_t k_gripper_move_speed = 800;
 constexpr double k_gripper_mm_min = 0.0;
-constexpr double k_gripper_mm_max = 100.0;
+constexpr double k_gripper_mm_max = 85.0;
 constexpr double k_grip_cmd_deadzone = 0.05;
 
 /// VR 摇杆夹爪速度指令 [-1, 1]；+1 张开，-1 闭合。
