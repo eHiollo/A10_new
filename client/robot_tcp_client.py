@@ -117,27 +117,73 @@ class RobotTcpClient:
         """查询 ``target_q_batch_`` 是否已执行完：``{"idle": bool, "remaining": int}``。"""
         return self._request_json("GET_POLICY_STATUS")
 
-    def wait_policy_idle(self, poll_s: float = 0.005, timeout_s: float = 120.0) -> None:
-        """轮询直到 ``remaining==0``（机器人 RT 已逐步执行完当前 batch）。"""
+    def wait_policy_idle(
+        self,
+        poll_s: float = 0.005,
+        timeout_s: float = 120.0,
+        should_stop=None,
+        expected_queued: int | None = None,
+    ) -> str:
+        """轮询直到 ``remaining==0``。返回 ``ok`` / ``skipped`` / ``stopped``。
+
+        驱动若在一个实时周期内把整段丢掉，remaining 会在几毫秒内变成 0。
+        若从未看到 remaining>0，或耗时短于 ``queued * 2 / 500Hz`` 的一半，判为 skip。
+        """
         t0 = time.time()
+        seen_busy = False
+        min_exec_s = 0.0
+        if expected_queued is not None and int(expected_queued) > 0:
+            min_exec_s = int(expected_queued) * 2.0 / 500.0
         while time.time() - t0 < timeout_s:
+            if should_stop is not None and should_stop():
+                return "stopped"
             st = self.get_policy_status()
+            rem = st.get("remaining")
+            if rem is None:
+                raise RuntimeError(f"GET_POLICY_STATUS missing 'remaining': {st!r}")
             try:
-                rem = int(st.get("remaining", -1))
-            except (TypeError, ValueError):
-                rem = -1
-            if rem == 0:
-                return
+                remaining = int(rem)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"GET_POLICY_STATUS 'remaining' not int: {st!r}") from exc
+            if remaining > 0:
+                seen_busy = True
+            if remaining == 0:
+                elapsed = time.time() - t0
+                too_fast = elapsed < max(0.015, min_exec_s * 0.5)
+                if too_fast or not seen_busy:
+                    logger.error(
+                        "policy batch skipped: remaining=0 elapsed=%.1fms queued=%s seen_busy=%s status=%s",
+                        elapsed * 1000.0,
+                        expected_queued,
+                        seen_busy,
+                        st,
+                    )
+                    return "skipped"
+                return "ok"
             time.sleep(poll_s)
         raise TimeoutError(f"wait_policy_idle exceeded {timeout_s}s")
 
-    def send_policy_actions_batch(self, actions: np.ndarray) -> None:
-        """发送 ``SET_JOINTS_BATCH`` 一行：``actions`` 为 ``(T, D)`` numpy。"""
+    def stop_policy(self) -> None:
+        """发送 ``STOP_POLICY``：清空 batch 队列并请求 policy 驱动退出，停在当前位置。"""
+        with self._lock:
+            try:
+                self._send_line("STOP_POLICY\n")
+                ack_raw = self._recv_line()
+                ack = json.loads(ack_raw)
+                if not ack.get("stopped", False):
+                    raise RuntimeError(f"STOP_POLICY not acknowledged by robot: {ack!r}")
+            except Exception:  # noqa: BLE001
+                logger.exception("Robot TCP STOP_POLICY failed.")
+                self.close()
+                raise
+
+    def send_policy_actions_batch(self, actions: np.ndarray) -> int:
+        """发送 ``SET_JOINTS_BATCH`` 一行：``actions`` 为 ``(T, D)`` numpy。返回入队步数。"""
         arr = np.asarray(actions, dtype=float)
         if arr.ndim == 1:
             arr = arr.reshape(1, -1)
         if arr.size == 0:
-            return
+            return 0
         rows = arr.tolist()
         payload = {"actions": rows}
         line = "SET_JOINTS_BATCH " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -148,6 +194,7 @@ class RobotTcpClient:
                 ack = json.loads(ack_raw)
                 if not ack.get("accepted", False):
                     raise RuntimeError(f"SET_JOINTS_BATCH rejected by robot: {ack!r}")
+                return int(ack.get("queued", 0))
             except Exception:  # noqa: BLE001
                 logger.exception("Robot TCP SET_JOINTS_BATCH failed.")
                 self.close()

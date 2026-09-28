@@ -142,13 +142,12 @@ int main(int argc, char *argv[]){
             }
             current_q[12] = a10_tcp::g_vr_grip_actual_mm.load(std::memory_order_acquire);
 
-            // chunk 执行期间不刷新 ``robot_q_``，客户端应轮询 ``GET_POLICY_STATUS`` 至 idle 后再 ``GET_FOLLOWER_STATE`` 做观测/推理。
-            if (g_tcp_server != nullptr && !g_tcp_server->policy_batch_queue_empty())
+            // 执行 chunk 期间也刷新查询缓冲。异步推理要在上一段还没走完时读到当前关节。
+            // send_set_joints 只更新 GET_FOLLOWER_STATE 用的 robot_q_，不下发电机指令。
+            if (g_tcp_server != nullptr)
             {
-                continue;
+                tcp_server.send_set_joints(current_q);
             }
-
-            tcp_server.send_set_joints(current_q);
         }
     });
     state_update_thread.detach();

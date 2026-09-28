@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 
 import cv2
@@ -164,3 +165,75 @@ class USBCamera:
         if self._cap is not None:
             self._cap.release()
             self._cap = None
+
+
+class ThreadedCamera:
+    """后台线程持续抓帧，``read_rgb`` 立刻返回最新一帧。
+
+    异步推理时避免每次观测都 open/read/close。两路相机可以各自持有句柄。
+    """
+
+    def __init__(self, cfg: CameraConfig) -> None:
+        self._cfg = cfg
+        self._stop = threading.Event()
+        self._frame_lock = threading.Lock()
+        self._latest: np.ndarray | None = None
+        self._open_error: Exception | None = None
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+
+    def _capture_loop(self) -> None:
+        source = _parse_source(self._cfg.source)
+        cap: cv2.VideoCapture | None = None
+        while not self._stop.is_set():
+            try:
+                if cap is None or not cap.isOpened():
+                    if cap is not None:
+                        cap.release()
+                    if self._cfg.exclusive_per_read:
+                        with _USB_CAPTURE_LOCK:
+                            cap = cv2.VideoCapture(source)
+                    else:
+                        cap = cv2.VideoCapture(source)
+                    if not cap.isOpened():
+                        raise RuntimeError(f"Failed to open USB camera source={self._cfg.source}")
+                    _configure_capture(cap, self._cfg.width, self._cfg.height)
+                    self._open_error = None
+                ok, frame_bgr = cap.read()
+                if not ok or frame_bgr is None:
+                    cap.release()
+                    cap = None
+                    continue
+                frame_rgb = _bgr_to_rgb(frame_bgr, self._cfg.rotate_180)
+                with self._frame_lock:
+                    self._latest = frame_rgb
+            except Exception as exc:  # noqa: BLE001
+                self._open_error = exc
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    cap = None
+                if not self._stop.is_set():
+                    time.sleep(0.2)
+        if cap is not None:
+            cap.release()
+
+    def read_rgb(self) -> np.ndarray:
+        t0 = time.time()
+        while True:
+            with self._frame_lock:
+                frame = self._latest
+                err = self._open_error
+            if frame is not None:
+                return frame
+            if err is not None and time.time() - t0 > 2.0:
+                raise RuntimeError(f"ThreadedCamera source={self._cfg.source} failed: {err}")
+            if time.time() - t0 > 5.0:
+                raise RuntimeError(f"ThreadedCamera source={self._cfg.source} timed out waiting first frame")
+            time.sleep(0.02)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)

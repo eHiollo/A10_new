@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -10,7 +12,7 @@ import numpy as np
 
 from openpi_ws_client import OpenPIWebsocketClient
 from robot_tcp_client import RobotTcpClient
-from usb_camera import CameraConfig, USBCamera
+from usb_camera import CameraConfig, ThreadedCamera, USBCamera
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,9 @@ class BridgeConfig:
     idle_timeout_s: float
     start_delay_s: float
     post_idle_settle_s: float
+    mode: str = "async"
+    buffer_target: int = 1
+    infer_backoff_s: float = 0.005
 
 
 class PiRobotBridge:
@@ -68,8 +73,8 @@ class PiRobotBridge:
         self,
         ws_client: OpenPIWebsocketClient,
         robot_client: RobotTcpClient,
-        right_cam: USBCamera,
-        top_cam: USBCamera | None,
+        right_cam: USBCamera | ThreadedCamera,
+        top_cam: USBCamera | ThreadedCamera | None,
         cfg: BridgeConfig,
     ) -> None:
         self._ws = ws_client
@@ -77,6 +82,10 @@ class PiRobotBridge:
         self._right_cam = right_cam
         self._top_cam = top_cam
         self._cfg = cfg
+        self._stop = threading.Event()
+        self._async_buffer: collections.deque[np.ndarray] = collections.deque()
+        self._async_buffer_lock = threading.Lock()
+        self._async_buffer_not_empty = threading.Condition(self._async_buffer_lock)
 
     def _build_observation(self, state_7d: np.ndarray) -> dict[str, Any]:
         right_rgb = USBCamera.as_policy_hwc(self._right_cam.read_rgb())
@@ -90,41 +99,63 @@ class PiRobotBridge:
             obs["observation/images/top"] = USBCamera.as_policy_hwc(self._top_cam.read_rgb())
         return obs
 
+    def _obs_state_7d(self) -> np.ndarray:
+        return _state_7d(self._robot.get_follower_state())
+
+    def _infer_chunk(self, state_7d: np.ndarray) -> np.ndarray:
+        obs = self._build_observation(state_7d)
+        infer_result = self._ws.infer(obs)
+        self._last_infer_result = infer_result
+        return _extract_action_chunk(infer_result, expected_dim=self._cfg.action_dim)
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._async_buffer_lock:
+            self._async_buffer_not_empty.notify_all()
+
     def run_forever(self) -> None:
+        if self._cfg.mode == "async":
+            self._run_async()
+        else:
+            self._run_sync()
+
+    def _run_sync(self) -> None:
         """推理 → ``SET_JOINTS_BATCH`` → 等机器人逐步执行完 → 再采 obs / 下一轮推理。"""
         infer_period_s = 1.0 / self._cfg.hz if self._cfg.hz > 0 else 0.0
         infer_cycle = 0
         if self._cfg.start_delay_s > 0:
             logger.info("启动延时 %.3fs：延时结束后开始发送 obs / 推理 / 执行动作。", self._cfg.start_delay_s)
             time.sleep(self._cfg.start_delay_s)
-        while True:
+        while not self._stop.is_set():
             t_cycle = time.time()
             try:
-                robot_state = self._robot.get_follower_state()
-                state_7d = _state_7d(robot_state)
-                obs = self._build_observation(state_7d)
-                infer_result = self._ws.infer(obs)
-                action_chunk = _extract_action_chunk(infer_result, expected_dim=self._cfg.action_dim)
+                state_7d = self._obs_state_7d()
+                action_chunk = self._infer_chunk(state_7d)
                 n = int(action_chunk.shape[0])
                 if n <= 0:
                     logger.warning("推理返回的 action 序列为空，跳过本轮。")
                     time.sleep(0.05)
                     continue
 
-                self._robot.send_policy_actions_batch(action_chunk)
-                self._robot.wait_policy_idle(
+                queued = self._robot.send_policy_actions_batch(action_chunk)
+                wait_st = self._robot.wait_policy_idle(
                     poll_s=self._cfg.idle_poll_s,
                     timeout_s=self._cfg.idle_timeout_s,
+                    should_stop=self._stop.is_set,
+                    expected_queued=queued,
                 )
+                if wait_st == "skipped":
+                    logger.error("sync: 机器人一拍跳过了当前 batch（未插值）。停止发送后续 chunk。")
+                    break
+                if wait_st == "stopped" or self._stop.is_set():
+                    break
                 if self._cfg.post_idle_settle_s > 0:
-                    # 机器人端 robot_q_ 由独立线程刷新，batch 期间会冻结；idle 后给一次刷新窗口，
-                    # 确保下一轮观测更接近“上一段动作执行结束”的真实位置。
                     time.sleep(self._cfg.post_idle_settle_s)
 
                 if infer_cycle % 20 == 0:
-                    policy_timing = infer_result.get("policy_timing") or {}
+                    policy_timing = getattr(self, "_last_infer_result", {}).get("policy_timing") or {}
                     logger.info(
-                        "infer_cycle=%d chunk_len=%d infer_ms=%s state=%s action[0]=%s",
+                        "sync infer_cycle=%d chunk_len=%d infer_ms=%s state=%s action[0]=%s",
                         infer_cycle,
                         n,
                         policy_timing.get("infer_ms"),
@@ -133,7 +164,7 @@ class PiRobotBridge:
                     )
                 infer_cycle += 1
             except Exception:  # noqa: BLE001
-                logger.exception("Bridge step failed. Retrying next cycle.")
+                logger.exception("Bridge sync step failed. Retrying next cycle.")
                 time.sleep(0.2)
 
             if infer_period_s > 0:
@@ -141,6 +172,89 @@ class PiRobotBridge:
                 remain = infer_period_s - elapsed
                 if remain > 0:
                     time.sleep(remain)
+
+    def _run_async(self) -> None:
+        """执行中采观测并推理，下一段到达后替换还没走完的队列。
+
+        控制器从当前指令姿态接到新队首，不等 remaining==0。
+        """
+        buffer = self._async_buffer
+        buffer_lock = self._async_buffer_lock
+        buffer_not_empty = self._async_buffer_not_empty
+        infer_cycle = 0
+
+        if self._cfg.start_delay_s > 0:
+            logger.info("async 启动延时 %.3fs。", self._cfg.start_delay_s)
+            time.sleep(self._cfg.start_delay_s)
+
+        def inferencer() -> None:
+            while not self._stop.is_set():
+                try:
+                    with buffer_lock:
+                        if len(buffer) >= self._cfg.buffer_target:
+                            buffer_not_empty.wait(timeout=self._cfg.infer_backoff_s)
+                            continue
+                    state_7d = self._obs_state_7d()
+                    chunk = self._infer_chunk(state_7d)
+                    with buffer_lock:
+                        buffer.append(chunk)
+                        buffer_not_empty.notify()
+                except Exception:  # noqa: BLE001
+                    logger.exception("async inferencer step failed.")
+                    time.sleep(0.2)
+
+        infer_thread = threading.Thread(target=inferencer, daemon=True)
+        infer_thread.start()
+        with buffer_lock:
+            while len(buffer) == 0 and not self._stop.is_set():
+                buffer_not_empty.wait(timeout=1.0)
+        if self._stop.is_set():
+            return
+
+        while not self._stop.is_set():
+            try:
+                with buffer_lock:
+                    while len(buffer) == 0 and not self._stop.is_set():
+                        buffer_not_empty.wait(timeout=1.0)
+                    if self._stop.is_set():
+                        break
+                    if len(buffer) == 0:
+                        continue
+                    action_chunk = buffer.popleft()
+                    buffer_not_empty.notify_all()
+
+                n = int(action_chunk.shape[0])
+                if n <= 0:
+                    logger.warning("async: chunk 为空，跳过。")
+                    continue
+
+                rem_before = -1
+                try:
+                    rem_before = int(self._robot.get_policy_status().get("remaining") or 0)
+                except Exception:  # noqa: BLE001
+                    rem_before = -1
+                queued = self._robot.send_policy_actions_batch(action_chunk)
+                if infer_cycle > 0 and rem_before <= 0:
+                    logger.warning(
+                        "async: cycle=%d rem_before=%s 队列已空才发下一段（没有叠上执行）",
+                        infer_cycle,
+                        rem_before,
+                    )
+                if infer_cycle % 20 == 0:
+                    policy_timing = getattr(self, "_last_infer_result", {}).get("policy_timing") or {}
+                    logger.info(
+                        "async send cycle=%d chunk_len=%d rem_before=%s queued=%d infer_ms=%s action[0]=%s",
+                        infer_cycle,
+                        n,
+                        rem_before,
+                        queued,
+                        policy_timing.get("infer_ms"),
+                        np.array2string(action_chunk[0], precision=4, suppress_small=True),
+                    )
+                infer_cycle += 1
+            except Exception:  # noqa: BLE001
+                logger.exception("async pusher step failed.")
+                time.sleep(0.2)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -203,7 +317,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="启动后在首次发送 obs / 推理 / 执行动作前等待的秒数（默认 1 秒）。",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["async", "sync"],
+        default="async",
+        help="async=执行中推理并替换未走完的队列；sync=走完再推理。",
+    )
+    parser.add_argument(
+        "--camera-mode",
+        choices=["threaded", "exclusive"],
+        default="threaded",
+        help="threaded=后台持续抓最新帧；exclusive=每帧独占打开（同总线掉帧时用）。",
+    )
+    parser.add_argument(
+        "--buffer-target",
+        type=int,
+        default=1,
+        help="async 模式下预先缓冲的 chunk 数，1 表示双缓冲。",
+    )
     return parser
+
+
+def _make_camera(source: str, width: int, height: int, rotate_180: bool, camera_mode: str, exclusive: bool):
+    cfg = CameraConfig(
+        source=source,
+        width=width,
+        height=height,
+        rotate_180=rotate_180,
+        exclusive_per_read=exclusive,
+    )
+    if camera_mode == "threaded":
+        return ThreadedCamera(cfg)
+    return USBCamera(cfg)
 
 
 def run_from_args(args: argparse.Namespace) -> None:
@@ -216,27 +361,24 @@ def run_from_args(args: argparse.Namespace) -> None:
     robot_client.connect()
 
     use_dual_cam = isinstance(args.top_camera, str) and args.top_camera.strip()
-    exclusive_per_read = bool(use_dual_cam)
-
-    right_cam = USBCamera(
-        CameraConfig(
-            source=args.right_camera,
-            width=args.camera_width,
-            height=args.camera_height,
-            rotate_180=bool(args.right_rotate_180),
-            exclusive_per_read=exclusive_per_read,
-        )
+    exclusive = bool(use_dual_cam) and args.camera_mode == "exclusive"
+    right_cam = _make_camera(
+        args.right_camera,
+        args.camera_width,
+        args.camera_height,
+        bool(args.right_rotate_180),
+        args.camera_mode,
+        exclusive,
     )
     top_cam = None
     if use_dual_cam:
-        top_cam = USBCamera(
-            CameraConfig(
-                source=args.top_camera.strip(),
-                width=args.camera_width,
-                height=args.camera_height,
-                rotate_180=bool(args.top_rotate_180),
-                exclusive_per_read=exclusive_per_read,
-            )
+        top_cam = _make_camera(
+            args.top_camera.strip(),
+            args.camera_width,
+            args.camera_height,
+            bool(args.top_rotate_180),
+            args.camera_mode,
+            exclusive,
         )
 
     bridge = PiRobotBridge(
@@ -252,14 +394,31 @@ def run_from_args(args: argparse.Namespace) -> None:
             idle_timeout_s=float(args.idle_timeout),
             start_delay_s=max(0.0, float(args.start_delay)),
             post_idle_settle_s=max(0.0, float(args.post_idle_settle)),
+            mode=str(args.mode),
+            buffer_target=max(1, int(args.buffer_target)),
         ),
     )
 
-    try:
-        bridge.run_forever()
-    finally:
+    interrupted = False
+
+    def _shutdown() -> None:
+        bridge.stop()
+        if interrupted:
+            logger.info("正在停止桥接：请求机器人 STOP_POLICY 并关闭连接...")
+            try:
+                robot_client.stop_policy()
+            except Exception:  # noqa: BLE001
+                logger.warning("STOP_POLICY 发送失败（可能连接已断）。")
         right_cam.close()
         if top_cam is not None:
             top_cam.close()
         robot_client.close()
         ws_client.close()
+
+    try:
+        bridge.run_forever()
+    except KeyboardInterrupt:
+        interrupted = True
+        logger.info("收到 Ctrl+C，开始优雅停止。")
+    finally:
+        _shutdown()

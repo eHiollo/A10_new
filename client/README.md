@@ -15,7 +15,10 @@
   - `observation/state`: `float32 (7,)`，关节绝对角 + 夹爪绝对开度（mm，约 0–85）
   - `observation/images/right`: `uint8 HWC` RGB，原始分辨率
   - `observation/images/top`: `uint8 HWC` RGB，原始分辨率；不接顶视相机时不发这个键
-- 组包观测并发起推理；将整段 `actions` 经 **`SET_JOINTS_BATCH`** 下发后，**轮询 `GET_POLICY_STATUS` 至 `remaining==0`**，再进入下一轮
+- 组包观测并发起推理，经 **`SET_JOINTS_BATCH`** 下发
+  - `--mode async`（默认）：执行中继续推理，下一段到达后替换还没走完的队列
+  - `--mode sync`：等 `GET_POLICY_STATUS` 的 `remaining==0` 再采下一次观测
+  - `STOP_POLICY`：清空队列并让 `policy` 下一拍退出，停在当前位置
 - 提供摄像头抓图脚本，按端口号命名图片（用于区分相机）
 
 ## 安装
@@ -44,6 +47,7 @@ cd /home/kaanh/Desktop/kaanhbin_wjy/client
 python3 run_bridge.py \
   --policy-host 192.168.110.119 --policy-port 8000 \
   --robot-host 127.0.0.1 --robot-port 8080 \
+  --mode async --camera-mode threaded \
   --hz 10 \
   --start-delay 1.0
 ```
@@ -72,4 +76,4 @@ python3 capture_cameras.py --sources /dev/video0 /dev/video2
 
 - 默认 `--action-dim=7`；策略 batch 每行 7 个数（与 `send_follower_state` / 电机映射一致）。
 - 机器人 TCP 默认端口 **8080**（与 `main.cpp` 一致）。
-- batch 执行期间机器人端会暂停刷新 `robot_q_`；请在 `GET_POLICY_STATUS` 为 `remaining==0` 后再读状态做观测/推理。
+- 异步模式下，batch 执行期间也会刷新 `robot_q_`，推理可以读到当前关节。Ctrl+C 会发 `STOP_POLICY`。

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <iostream>
 
+#include "a10_policy_tcp_plan.hpp"
 #include "a10_vr_plan.hpp"
 #include "a10_vr_reset_command.hpp"
 #include "kaanh/general/json.hpp"
@@ -473,6 +474,15 @@ void A10TcpServer::process_line(
     if (line.find("GET_POLICY_STATUS") != std::string::npos)
     {
         send_policy_status(client_sock);
+        return;
+    }
+
+    // 异步桥接优雅停止：清空 batch 队列，并让正在跑的 policy 下一拍退出，停在当前位置。
+    if (line.find("STOP_POLICY") != std::string::npos)
+    {
+        a10_tcp::g_a10_policy_tcp_stop_requested.store(true, std::memory_order_release);
+        clear_policy_tcp_targets_nrt();
+        send_line_to_client(client_sock, "{\"stopped\":true}\n");
         return;
     }
 
