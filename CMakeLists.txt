@@ -104,3 +104,15 @@ add_dependencies(kaanhbin sync_kaanh_xml)
 add_executable(client ${PROJECT_SOURCE_DIR}/client.cpp)
 target_include_directories(client PUBLIC ${PROJECT_BINARY_DIR})
 target_link_libraries(client PUBLIC ${kaanhbot_LIBRARIES})
+
+# Opt-in SDK authentication test: no controller start, sockets or motor commands.
+option(A10_BUILD_STARTUP_LOGIN_TEST "Build the offline SDK startup login test" OFF)
+if(A10_BUILD_STARTUP_LOGIN_TEST)
+    enable_testing()
+    add_executable(a10_startup_login_test tests/a10_startup_login_test.cpp)
+    target_link_libraries(a10_startup_login_test PRIVATE ${kaanhbot_LIBRARIES})
+    set_target_properties(a10_startup_login_test PROPERTIES
+        BUILD_RPATH "/opt/etherlab/lib;/usr/kaanhbot/kaanhbot-2.5.7/lib/release;/usr/kaanh/kaanh-2.5.7/lib/release;/usr/aris/aris-2.5.7/lib/release"
+    )
+    add_test(NAME a10_startup_login COMMAND a10_startup_login_test)
+endif()

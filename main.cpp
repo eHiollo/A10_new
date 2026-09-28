@@ -14,6 +14,7 @@
 #include "plan.hpp"
 #include "a10_gripper_bridge.hpp"
 #include "a10_tcp_server.hpp"
+#include "a10_startup_login.hpp"
 #include "a10_vr_plan.hpp"
 #include "gripper.hpp"
 
@@ -123,6 +124,9 @@ int main(int argc, char *argv[]){
     std::thread([]() { a10_tcp::run_gripper_service_loop(g_gripper); }).detach();
 
     cs.init();
+
+    // Authenticate after UserManagement initialization, before startup commands.
+    a10_auth::auto_login_manufacturer(std::cout, std::cerr);
 
     // 独立线程：仅把**当前关节反馈**写入 TCP 侧 robot_q_，供外部 GET_FOLLOWER_STATE / GET_LEADER_STATE 查询。
     // 必须在 cs.init() 之后启动，避免电机池尚未建好时读 actualPos。
