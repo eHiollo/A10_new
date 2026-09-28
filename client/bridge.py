@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,6 +11,7 @@ import numpy as np
 
 from openpi_ws_client import OpenPIWebsocketClient
 from robot_tcp_client import RobotTcpClient
+from runtime_logging import record_timing_event
 from usb_camera import CameraConfig, USBCamera
 
 logger = logging.getLogger(__name__)
@@ -91,56 +93,102 @@ class PiRobotBridge:
         return obs
 
     def run_forever(self) -> None:
-        """推理 → ``SET_JOINTS_BATCH`` → 等机器人逐步执行完 → 再采 obs / 下一轮推理。"""
+        """推理、下发动作、等待机器人执行；持续记录每轮的阶段耗时。"""
         infer_period_s = 1.0 / self._cfg.hz if self._cfg.hz > 0 else 0.0
         infer_cycle = 0
         if self._cfg.start_delay_s > 0:
             logger.info("启动延时 %.3fs：延时结束后开始发送 obs / 推理 / 执行动作。", self._cfg.start_delay_s)
             time.sleep(self._cfg.start_delay_s)
         while True:
-            t_cycle = time.time()
+            t_cycle = time.perf_counter()
             try:
-                robot_state = self._robot.get_follower_state()
-                state_7d = _state_7d(robot_state)
-                obs = self._build_observation(state_7d)
-                infer_result = self._ws.infer(obs)
-                action_chunk = _extract_action_chunk(infer_result, expected_dim=self._cfg.action_dim)
-                n = int(action_chunk.shape[0])
-                if n <= 0:
-                    logger.warning("推理返回的 action 序列为空，跳过本轮。")
+                if not self._run_cycle(infer_cycle):
                     time.sleep(0.05)
                     continue
-
-                self._robot.send_policy_actions_batch(action_chunk)
-                self._robot.wait_policy_idle(
-                    poll_s=self._cfg.idle_poll_s,
-                    timeout_s=self._cfg.idle_timeout_s,
-                )
-                if self._cfg.post_idle_settle_s > 0:
-                    # 机器人端 robot_q_ 由独立线程刷新，batch 期间会冻结；idle 后给一次刷新窗口，
-                    # 确保下一轮观测更接近“上一段动作执行结束”的真实位置。
-                    time.sleep(self._cfg.post_idle_settle_s)
-
-                if infer_cycle % 20 == 0:
-                    policy_timing = infer_result.get("policy_timing") or {}
-                    logger.info(
-                        "infer_cycle=%d chunk_len=%d infer_ms=%s state=%s action[0]=%s",
-                        infer_cycle,
-                        n,
-                        policy_timing.get("infer_ms"),
-                        np.array2string(state_7d, precision=4, suppress_small=True),
-                        np.array2string(action_chunk[0], precision=4, suppress_small=True),
-                    )
-                infer_cycle += 1
             except Exception:  # noqa: BLE001
                 logger.exception("Bridge step failed. Retrying next cycle.")
                 time.sleep(0.2)
+            finally:
+                # Every attempt gets a unique ID, including errors and empty responses.
+                infer_cycle += 1
 
             if infer_period_s > 0:
-                elapsed = time.time() - t_cycle
+                elapsed = time.perf_counter() - t_cycle
                 remain = infer_period_s - elapsed
                 if remain > 0:
                     time.sleep(remain)
+
+    def _run_cycle(self, infer_cycle: int) -> bool:
+        """记录一轮端到端耗时；异常时也保留已完成阶段及失败阶段。"""
+        started = time.perf_counter()
+        metrics: dict[str, int | float | str] = {"cycle": infer_cycle}
+        stage_name = "start"
+        outcome = "error"
+        record_timing_event("cycle_start", cycle=infer_cycle)
+
+        @contextmanager
+        def stage(name: str):
+            nonlocal stage_name
+            stage_name = name
+            stage_started = time.perf_counter()
+            record_timing_event("stage_start", cycle=infer_cycle, stage=name)
+            try:
+                yield
+            finally:
+                metrics[f"{name}_ms"] = round((time.perf_counter() - stage_started) * 1000, 3)
+
+        try:
+            with stage("state"):
+                robot_state = self._robot.get_follower_state()
+                state_7d = _state_7d(robot_state)
+            with stage("camera"):
+                obs = self._build_observation(state_7d)
+                metrics["image_bytes"] = sum(
+                    image.nbytes for key, image in obs.items() if key.startswith("observation/images/")
+                )
+            with stage("inference"):
+                infer_result = self._ws.infer(obs)
+                action_chunk = _extract_action_chunk(infer_result, expected_dim=self._cfg.action_dim)
+            policy_timing = infer_result.get("policy_timing") or {}
+            if isinstance(policy_timing, dict) and isinstance(policy_timing.get("infer_ms"), (int, float)):
+                metrics["server_infer_ms"] = policy_timing["infer_ms"]
+            n = int(action_chunk.shape[0])
+            metrics["chunk_len"] = n
+            if n <= 0:
+                outcome = "empty_actions"
+                logger.warning("推理返回的 action 序列为空，跳过本轮。")
+                return False
+
+            with stage("send_batch"):
+                self._robot.send_policy_actions_batch(action_chunk)
+            with stage("execute_wait"):
+                metrics["status_polls"] = self._robot.wait_policy_idle(
+                    poll_s=self._cfg.idle_poll_s,
+                    timeout_s=self._cfg.idle_timeout_s,
+                )
+            if self._cfg.post_idle_settle_s > 0:
+                # batch 期间状态刷新可能暂停；等待一次刷新窗口。
+                with stage("settle"):
+                    time.sleep(self._cfg.post_idle_settle_s)
+
+            if infer_cycle % 20 == 0:
+                logger.info(
+                    "infer_cycle=%d chunk_len=%d infer_ms=%s state=%s action[0]=%s",
+                    infer_cycle,
+                    n,
+                    metrics.get("server_infer_ms"),
+                    np.array2string(state_7d, precision=4, suppress_small=True),
+                    np.array2string(action_chunk[0], precision=4, suppress_small=True),
+                )
+            outcome = "ok"
+            return True
+        except Exception as exc:
+            metrics["failed_stage"] = stage_name
+            metrics["error_type"] = type(exc).__name__
+            raise
+        finally:
+            metrics["cycle_ms"] = round((time.perf_counter() - started) * 1000, 3)
+            record_timing_event("cycle_end", outcome=outcome, **metrics)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -197,6 +245,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="检测到 remaining==0 后额外等待的时间（秒），用于等待状态线程刷新 robot_q_。",
     )
     parser.add_argument("--action-dim", type=int, default=7)
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default="logs",
+        help="运行日志目录（默认当前工作目录下的 logs；日志按大小轮转）。",
+    )
     parser.add_argument(
         "--start-delay",
         type=float,

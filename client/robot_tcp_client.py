@@ -117,17 +117,19 @@ class RobotTcpClient:
         """查询 ``target_q_batch_`` 是否已执行完：``{"idle": bool, "remaining": int}``。"""
         return self._request_json("GET_POLICY_STATUS")
 
-    def wait_policy_idle(self, poll_s: float = 0.005, timeout_s: float = 120.0) -> None:
+    def wait_policy_idle(self, poll_s: float = 0.005, timeout_s: float = 120.0) -> int:
         """轮询直到 ``remaining==0``（机器人 RT 已逐步执行完当前 batch）。"""
-        t0 = time.time()
-        while time.time() - t0 < timeout_s:
+        t0 = time.perf_counter()
+        polls = 0
+        while time.perf_counter() - t0 < timeout_s:
             st = self.get_policy_status()
+            polls += 1
             try:
                 rem = int(st.get("remaining", -1))
             except (TypeError, ValueError):
                 rem = -1
             if rem == 0:
-                return
+                return polls
             time.sleep(poll_s)
         raise TimeoutError(f"wait_policy_idle exceeded {timeout_s}s")
 

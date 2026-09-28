@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import logging
-
 from bridge import build_arg_parser, run_from_args
+from runtime_logging import configure_logging
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
     parser = build_arg_parser()
     args = parser.parse_args()
+    configure_logging(args.log_dir)
     run_from_args(args)
 
 

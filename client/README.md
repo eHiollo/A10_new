@@ -56,6 +56,22 @@ python3 run_bridge.py \
 
 默认启动后等待 `1` 秒再首次推理。`--post-idle-settle`（默认 `0.05s`）在 `remaining==0` 后再短暂等待，避免读到 batch 期间冻结的旧状态。
 
+## 实机运行日志与耗时定位
+
+桥接程序默认在当前工作目录的 logs/ 写入两个文件：
+
+- vla_bridge.log：连接、告警、异常堆栈及原有每 20 轮动作摘要。
+- vla_timing.jsonl：每轮的 JSON 行事件。cycle_start 和 stage_start 可定位尚未返回的调用；cycle_end 包含各阶段毫秒耗时、结果和失败阶段。
+
+建议进入 client/ 再启动，或用 --log-dir 指定绝对路径：
+
+    cd client
+    python3 run_bridge.py --policy-host 192.168.110.119 --robot-host 127.0.0.1 --log-dir logs
+
+cycle_end 中，state_ms 是机器人状态请求耗时；camera_ms 是相机取帧耗时；inference_ms 是发送观测至收到并解析推理结果的客户端耗时；server_infer_ms 是服务端返回的内部推理耗时（若有）；send_batch_ms 包含动作序列化和机器人确认；execute_wait_ms 包含轮询和实机执行等待；settle_ms 是配置的状态刷新等待。cycle_ms 是本轮总耗时，不含按 --hz 补足的节流时间。status_polls 是状态查询次数，image_bytes 是原始图像字节数。异常轮次记录 outcome=error、failed_stage 和 error_type；详细堆栈见普通日志。
+
+两个文件分别按 20 MiB 轮转，保留 5 份历史。时间戳为 UTC，耗时使用单调时钟。日志不保存图像或整段动作。机器人进程原有的控制台输出需在启动机器人时另行重定向保存，例如 ./build/bin/kaanhbin > robot.log 2>&1；本功能不会改变机器人实时控制线程的写盘路径。
+
 ## 摄像头端口识别（抓图）
 
 ```bash
