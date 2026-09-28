@@ -1646,9 +1646,9 @@
                 <Command __prop_name__="command" name="policy">
                     <GroupParam name="group_param">
                         <Param name="arm_vel" abbreviation="a" default="0.05"/>
-                        <Param name="grip_vel" abbreviation="g" default="0.15"/>
+                        <Param name="grip_vel" abbreviation="g" default="80"/>
                         <Param name="max_axis_delta" abbreviation="x" default="0.5"/>
-                        <Param name="max_grip_delta" abbreviation="h" default="0.6"/>
+                        <Param name="max_grip_delta" abbreviation="h" default="85"/>
                     </GroupParam>
                 </Command>
             </A10PolicyTcpDriver>

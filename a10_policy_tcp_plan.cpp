@@ -236,10 +236,11 @@ struct A10PolicyTcpDriver::Imp
     JointSegment legacy_seg;
     std::vector<double> last_legacy_target;
     double max_arm_vel_rad_s{0.4};
-    double max_gripper_vel{0.15};
-    /// batch 队首与当前实际比较：任一角超过则丢弃该 keyframe（rad / 夹爪同单位）。
+    /// 夹爪绝对开度插值速度，mm/s。行程 0–85 mm。
+    double max_gripper_vel{80.0};
+    /// batch 队首与当前实际比较：任一角超过则丢弃该 keyframe（rad / 夹爪 mm）。
     double max_axis_delta_rad_{2.0};
-    double max_grip_delta_{0.6};
+    double max_grip_delta_{85.0};
     /// 与 ``A10TcpServer::policy_batch_commit_seq()`` 对齐，仅在新一批首次 keyframe 打一行 RT 日志。
     std::uint64_t last_logged_batch_commit_seq_{0};
     /// 当前执行中的 batch 序号；当序号变化时重置连续段衔接状态。
@@ -486,9 +487,9 @@ A10PolicyTcpDriver::A10PolicyTcpDriver(const std::string& name) : imp_(new Imp)
         "<Command name=\"policy\">"
         "  <GroupParam name=\"group_param\">"
         "    <Param name=\"arm_vel\" abbreviation=\"a\" default=\"0.05\"/>"
-        "    <Param name=\"grip_vel\" abbreviation=\"g\" default=\"0.15\"/>"
+        "    <Param name=\"grip_vel\" abbreviation=\"g\" default=\"80\"/>"
         "    <Param name=\"max_axis_delta\" abbreviation=\"x\" default=\"0.5\"/>"
-        "    <Param name=\"max_grip_delta\" abbreviation=\"h\" default=\"0.6\"/>"
+        "    <Param name=\"max_grip_delta\" abbreviation=\"h\" default=\"85\"/>"
         "  </GroupParam>"
         "</Command>");
 }

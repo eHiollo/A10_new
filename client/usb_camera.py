@@ -122,6 +122,26 @@ class USBCamera:
         return self._read_persistent()
 
     @staticmethod
+    def as_policy_hwc(frame_rgb: np.ndarray) -> np.ndarray:
+        """推理服务要的图像：``uint8`` HWC RGB，保持相机原始分辨率。
+
+        服务端会自行转成 HWC、pad 并缩放到 224×224。这里不要再缩放或改成 CHW。
+        """
+        frame = np.asarray(frame_rgb)
+        if frame.ndim != 3 or frame.shape[-1] < 3 or frame.size == 0:
+            raise RuntimeError(f"invalid camera frame shape={getattr(frame, 'shape', None)}")
+        frame = frame[..., :3]
+        if np.issubdtype(frame.dtype, np.floating):
+            max_v = float(np.max(frame)) if frame.size > 0 else 0.0
+            if max_v <= 1.01:
+                frame = (np.clip(frame, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+            else:
+                frame = np.clip(frame, 0.0, 255.0).round().astype(np.uint8)
+        else:
+            frame = frame.astype(np.uint8, copy=False)
+        return np.ascontiguousarray(frame, dtype=np.uint8)
+
+    @staticmethod
     def preprocess_to_policy_chw(frame_rgb: np.ndarray, size: int = 224) -> np.ndarray:
         frame = np.asarray(frame_rgb)
         if frame.ndim != 3 or frame.shape[-1] < 3 or frame.size == 0:

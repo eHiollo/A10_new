@@ -15,13 +15,17 @@ from usb_camera import CameraConfig, USBCamera
 logger = logging.getLogger(__name__)
 
 
-def _normalize_state_7d(values: list[float]) -> np.ndarray:
+def _state_7d(values: list[float]) -> np.ndarray:
+    """``(7,) float32``：关节 0–5 为绝对角（rad），第 6 维为夹爪绝对开度（mm）。
+
+    不做归一化，quantile 统计在推理服务端。
+    """
     arr = np.asarray(values, dtype=np.float32).reshape(-1)
     if arr.shape[0] >= 7:
         out = arr[:7]
     else:
         out = np.concatenate([arr, np.zeros((7 - arr.shape[0],), dtype=np.float32)], axis=0)
-    return np.ascontiguousarray(out.reshape(1, 7), dtype=np.float32)
+    return np.ascontiguousarray(out, dtype=np.float32)
 
 
 def _extract_action_chunk(result: dict[str, Any], expected_dim: int = 7) -> np.ndarray:
@@ -44,6 +48,7 @@ def _extract_action_chunk(result: dict[str, Any], expected_dim: int = 7) -> np.n
     if actions.shape[-1] > expected_dim:
         actions = actions[:, :expected_dim]
 
+    # 服务端已把预测增量加回当前 state，并裁成 (T, 7)。这里原样下发，不要再加 state。
     return np.ascontiguousarray(actions, dtype=np.float32)
 
 
@@ -74,21 +79,16 @@ class PiRobotBridge:
         self._cfg = cfg
 
     def _build_observation(self, state_7d: np.ndarray) -> dict[str, Any]:
-        right_rgb = self._right_cam.read_rgb()
-        if self._top_cam is not None:
-            top_rgb = self._top_cam.read_rgb()
-        else:
-            top_rgb = right_rgb
-
-        right_chw = USBCamera.preprocess_to_policy_chw(right_rgb, size=224)
-        top_chw = USBCamera.preprocess_to_policy_chw(top_rgb, size=224)
-
-        return {
+        right_rgb = USBCamera.as_policy_hwc(self._right_cam.read_rgb())
+        obs: dict[str, Any] = {
             "observation/state": state_7d,
-            "observation/images/right": right_chw,
-            "observation/images/top": top_chw,
+            "observation/images/right": right_rgb,
             "prompt": self._cfg.prompt,
         }
+        # 缺 top 时不要用右腕画面顶上。服务端会把缺的那路填成黑图且 mask=false。
+        if self._top_cam is not None:
+            obs["observation/images/top"] = USBCamera.as_policy_hwc(self._top_cam.read_rgb())
+        return obs
 
     def run_forever(self) -> None:
         """推理 → ``SET_JOINTS_BATCH`` → 等机器人逐步执行完 → 再采 obs / 下一轮推理。"""
@@ -101,7 +101,7 @@ class PiRobotBridge:
             t_cycle = time.time()
             try:
                 robot_state = self._robot.get_follower_state()
-                state_7d = _normalize_state_7d(robot_state)
+                state_7d = _state_7d(robot_state)
                 obs = self._build_observation(state_7d)
                 infer_result = self._ws.infer(obs)
                 action_chunk = _extract_action_chunk(infer_result, expected_dim=self._cfg.action_dim)
@@ -122,11 +122,13 @@ class PiRobotBridge:
                     time.sleep(self._cfg.post_idle_settle_s)
 
                 if infer_cycle % 20 == 0:
+                    policy_timing = infer_result.get("policy_timing") or {}
                     logger.info(
-                        "infer_cycle=%d chunk_len=%d state=%s action[0]=%s",
+                        "infer_cycle=%d chunk_len=%d infer_ms=%s state=%s action[0]=%s",
                         infer_cycle,
                         n,
-                        np.array2string(state_7d[0], precision=4, suppress_small=True),
+                        policy_timing.get("infer_ms"),
+                        np.array2string(state_7d, precision=4, suppress_small=True),
                         np.array2string(action_chunk[0], precision=4, suppress_small=True),
                     )
                 infer_cycle += 1
@@ -143,7 +145,7 @@ class PiRobotBridge:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Bridge OpenPI websocket inference with this repo's a10_tcp_server (TCP).")
-    parser.add_argument("--policy-host", type=str, default="127.0.0.1")
+    parser.add_argument("--policy-host", type=str, default="192.168.110.119")
     parser.add_argument("--policy-port", type=int, default=8000)
     parser.add_argument("--policy-api-key", type=str, default=None)
     parser.add_argument("--robot-host", type=str, default="127.0.0.1")
@@ -163,23 +165,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--top-camera",
         type=str,
         default="0",
-        help="顶视 / third-person 相机（默认 video0）。传空字符串则复用右相机画面。",
+        help="顶视 / third-person 相机（默认 video0），对应 observation/images/top。传空字符串则不发这一路，服务端按没看到处理。",
     )
     parser.add_argument(
         "--right-rotate-180",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="右相机画面旋转 180° 再送入策略（倒装安装时开启，默认关闭）。",
+        default=True,
+        help="右相机画面旋转 180° 再送入策略（右腕倒装，默认开启）。",
     )
     parser.add_argument(
         "--top-rotate-180",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="顶视相机画面旋转 180° 再送入策略（倒装安装时开启，默认开启）。",
+        default=False,
+        help="顶视相机画面旋转 180° 再送入策略（默认关闭）。",
     )
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
-    parser.add_argument("--prompt", type=str, default="Reach the target fruit on the table.")
+    parser.add_argument("--prompt", type=str, default="pick and place")
     parser.add_argument(
         "--hz",
         type=float,
