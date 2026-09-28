@@ -11,10 +11,10 @@
   - 单行即时目标（与策略 batch 无关）：`{"q":[...]}\n` → `target_q_`
   - **策略轨迹（多步）**：`SET_JOINTS_BATCH {"actions":[[7 floats],...]}\n` → 服务端入队 `target_q_batch_` 并**立即回一行** `{"accepted":true,"queued":T}\n`（失败为 `accepted:false`）
   - 策略是否执行完：`GET_POLICY_STATUS` → `{"idle":bool,"remaining":int}`（`remaining` 为队列中尚未执行的步数）
-- 从 USB 摄像头读取图像，按推理服务约定原样发送（不做归一化、不在客户端缩放到 224）
+- 从 USB 摄像头读取图像，用 `openpi_client.image_tools.resize_with_pad` 等比缩到 224×224 再补黑边（不直接拉伸），保持 RGB、HWC、uint8
   - `observation/state`: `float32 (7,)`，关节绝对角 + 夹爪绝对开度（mm，约 0–85）
-  - `observation/images/right`: `uint8 HWC` RGB，原始分辨率
-  - `observation/images/top`: `uint8 HWC` RGB，原始分辨率；不接顶视相机时不发这个键
+  - `observation/images/right`: `uint8 HWC` RGB，224×224
+  - `observation/images/top`: `uint8 HWC` RGB，224×224；不接顶视相机时不发这个键
 - 组包观测并发起推理，经 **`SET_JOINTS_BATCH`** 下发
   - `--mode async`（默认）：执行中继续推理，下一段到达后替换还没走完的队列
   - `--mode sync`：等 `GET_POLICY_STATUS` 的 `remaining==0` 再采下一次观测

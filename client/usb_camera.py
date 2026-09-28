@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
+from openpi_client import image_tools
 
 logger = logging.getLogger(__name__)
 
@@ -124,9 +125,9 @@ class USBCamera:
 
     @staticmethod
     def as_policy_hwc(frame_rgb: np.ndarray) -> np.ndarray:
-        """推理服务要的图像：``uint8`` HWC RGB，保持相机原始分辨率。
+        """推理图像：RGB、HWC、uint8，等比缩到 224×224 再补黑边。
 
-        服务端会自行转成 HWC、pad 并缩放到 224×224。这里不要再缩放或改成 CHW。
+        与训练时 ``openpi_client.image_tools.resize_with_pad`` 一致，不直接拉伸。
         """
         frame = np.asarray(frame_rgb)
         if frame.ndim != 3 or frame.shape[-1] < 3 or frame.size == 0:
@@ -140,6 +141,7 @@ class USBCamera:
                 frame = np.clip(frame, 0.0, 255.0).round().astype(np.uint8)
         else:
             frame = frame.astype(np.uint8, copy=False)
+        frame = image_tools.convert_to_uint8(image_tools.resize_with_pad(frame, 224, 224))
         return np.ascontiguousarray(frame, dtype=np.uint8)
 
     @staticmethod
