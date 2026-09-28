@@ -1,5 +1,7 @@
 # client（VLA / OpenPI 桥接）
 
+动态口令工具见 [KAANH_PASSPORT.md](KAANH_PASSPORT.md)。
+
 把 OpenPI 推理服务（websocket）与本仓库 `a10_tcp_server.cpp` 的机器人 TCP 服务桥接起来。  
 原独立目录：`/home/kaanh/Desktop/kannhbin_client`，已并入本仓库 `client/`。
 
