@@ -37,6 +37,9 @@ public:
     bool policy_batch_queue_empty();
     std::size_t policy_batch_queue_size();
     std::uint64_t policy_batch_commit_seq();
+    /// 同一把锁里按 ``obs_age_s / action_step_s`` 丢掉队首过期帧，至少留 1 帧。
+    /// ``expected_seq`` 与当前 batch 不一致时返回 -1，调用方下个周期再对齐。
+    int drop_policy_batch_prefix(std::uint64_t expected_seq, double action_step_s, double* age_s_out);
     void clear_policy_tcp_targets_nrt();
 
     bool fetch_ee_delta_if_updated(
@@ -76,6 +79,8 @@ private:
     std::mutex batch_mutex_;
     std::deque<std::vector<double>> target_q_batch_;
     std::uint64_t batch_commit_seq_{0};
+    /// 本批观测从采集到入队经过的秒数。10 步一共 0.33s 时，用来丢掉已经过期的前缀。
+    double batch_obs_age_s_{0.0};
 
     std::mutex ee_delta_mutex_;
     std::vector<double> target_ee_delta_;

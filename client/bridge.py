@@ -83,7 +83,7 @@ class PiRobotBridge:
         self._top_cam = top_cam
         self._cfg = cfg
         self._stop = threading.Event()
-        self._async_buffer: collections.deque[np.ndarray] = collections.deque()
+        self._async_buffer: collections.deque[tuple[np.ndarray, float]] = collections.deque()
         self._async_buffer_lock = threading.Lock()
         self._async_buffer_not_empty = threading.Condition(self._async_buffer_lock)
 
@@ -129,6 +129,7 @@ class PiRobotBridge:
         while not self._stop.is_set():
             t_cycle = time.time()
             try:
+                t_obs = time.perf_counter()
                 state_7d = self._obs_state_7d()
                 action_chunk = self._infer_chunk(state_7d)
                 n = int(action_chunk.shape[0])
@@ -137,7 +138,8 @@ class PiRobotBridge:
                     time.sleep(0.05)
                     continue
 
-                queued = self._robot.send_policy_actions_batch(action_chunk)
+                obs_age_s = time.perf_counter() - t_obs
+                queued = self._robot.send_policy_actions_batch(action_chunk, obs_age_s=obs_age_s)
                 wait_st = self._robot.wait_policy_idle(
                     poll_s=self._cfg.idle_poll_s,
                     timeout_s=self._cfg.idle_timeout_s,
@@ -194,10 +196,11 @@ class PiRobotBridge:
                         if len(buffer) >= self._cfg.buffer_target:
                             buffer_not_empty.wait(timeout=self._cfg.infer_backoff_s)
                             continue
+                    t_obs = time.perf_counter()
                     state_7d = self._obs_state_7d()
                     chunk = self._infer_chunk(state_7d)
                     with buffer_lock:
-                        buffer.append(chunk)
+                        buffer.append((chunk, t_obs))
                         buffer_not_empty.notify()
                 except Exception:  # noqa: BLE001
                     logger.exception("async inferencer step failed.")
@@ -220,7 +223,7 @@ class PiRobotBridge:
                         break
                     if len(buffer) == 0:
                         continue
-                    action_chunk = buffer.popleft()
+                    action_chunk, t_obs = buffer.popleft()
                     buffer_not_empty.notify_all()
 
                 n = int(action_chunk.shape[0])
@@ -233,7 +236,8 @@ class PiRobotBridge:
                     rem_before = int(self._robot.get_policy_status().get("remaining") or 0)
                 except Exception:  # noqa: BLE001
                     rem_before = -1
-                queued = self._robot.send_policy_actions_batch(action_chunk)
+                obs_age_s = time.perf_counter() - t_obs
+                queued = self._robot.send_policy_actions_batch(action_chunk, obs_age_s=obs_age_s)
                 if infer_cycle > 0 and rem_before <= 0:
                     logger.warning(
                         "async: cycle=%d rem_before=%s 队列已空才发下一段（没有叠上执行）",
@@ -243,11 +247,12 @@ class PiRobotBridge:
                 if infer_cycle % 20 == 0:
                     policy_timing = getattr(self, "_last_infer_result", {}).get("policy_timing") or {}
                     logger.info(
-                        "async send cycle=%d chunk_len=%d rem_before=%s queued=%d infer_ms=%s action[0]=%s",
+                        "async send cycle=%d chunk_len=%d rem_before=%s queued=%d obs_age_s=%.3f infer_ms=%s action[0]=%s",
                         infer_cycle,
                         n,
                         rem_before,
                         queued,
+                        obs_age_s,
                         policy_timing.get("infer_ms"),
                         np.array2string(action_chunk[0], precision=4, suppress_small=True),
                     )

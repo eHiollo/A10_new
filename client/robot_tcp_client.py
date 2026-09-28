@@ -177,15 +177,21 @@ class RobotTcpClient:
                 self.close()
                 raise
 
-    def send_policy_actions_batch(self, actions: np.ndarray) -> int:
-        """发送 ``SET_JOINTS_BATCH`` 一行：``actions`` 为 ``(T, D)`` numpy。返回入队步数。"""
+    def send_policy_actions_batch(self, actions: np.ndarray, obs_age_s: float | None = None) -> int:
+        """发送 ``SET_JOINTS_BATCH`` 一行：``actions`` 为 ``(T, D)`` numpy。返回入队步数。
+
+        ``obs_age_s`` 是从采到 state/图像到这一批入队经过的秒数。控制器按每步 0.033s
+        （10 步共 0.33s）丢掉已经过期的前缀。
+        """
         arr = np.asarray(actions, dtype=float)
         if arr.ndim == 1:
             arr = arr.reshape(1, -1)
         if arr.size == 0:
             return 0
         rows = arr.tolist()
-        payload = {"actions": rows}
+        payload: dict[str, object] = {"actions": rows}
+        if obs_age_s is not None and obs_age_s >= 0.0:
+            payload["obs_age_s"] = float(obs_age_s)
         line = "SET_JOINTS_BATCH " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
         with self._lock:
             try:

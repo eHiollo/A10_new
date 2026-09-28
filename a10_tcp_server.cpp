@@ -1,6 +1,7 @@
 #include "a10_tcp_server.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 
 #include "a10_policy_tcp_plan.hpp"
@@ -259,6 +260,39 @@ std::uint64_t A10TcpServer::policy_batch_commit_seq()
 {
     std::lock_guard<std::mutex> lk(batch_mutex_);
     return batch_commit_seq_;
+}
+
+int A10TcpServer::drop_policy_batch_prefix(std::uint64_t expected_seq, double action_step_s, double* age_s_out)
+{
+    std::lock_guard<std::mutex> lk(batch_mutex_);
+    if (expected_seq != batch_commit_seq_)
+    {
+        return -1;
+    }
+    const double age = (std::isfinite(batch_obs_age_s_) && batch_obs_age_s_ > 0.0) ? batch_obs_age_s_ : 0.0;
+    if (age_s_out != nullptr)
+    {
+        *age_s_out = age;
+    }
+    if (target_q_batch_.empty() || !(action_step_s > 0.0) || age <= 0.0)
+    {
+        return 0;
+    }
+    int skip = static_cast<int>(std::floor((age + 1e-9) / action_step_s));
+    const int max_skip = static_cast<int>(target_q_batch_.size()) - 1;
+    if (skip > max_skip)
+    {
+        skip = max_skip;
+    }
+    if (skip < 0)
+    {
+        skip = 0;
+    }
+    for (int i = 0; i < skip; ++i)
+    {
+        target_q_batch_.pop_front();
+    }
+    return skip;
 }
 
 void A10TcpServer::clear_policy_tcp_targets_nrt()
@@ -623,19 +657,19 @@ void A10TcpServer::process_line(
                 std::cout << "SET_JOINTS_BATCH: warning JSON actions length " << actions_array_len
                           << " != parsed keyframes " << n << " (skipped rows → 队首可能不是模型 actions[0])\n";
             }
-            if (!new_batch.empty())
+            double obs_age_s = 0.0;
+            if (j.contains("obs_age_s") && j["obs_age_s"].is_number())
             {
-                const auto& f = new_batch.front();
-                std::cout << "SET_JOINTS_BATCH: queued n=" << n << " queue_front[0..6]=";
-                for (int i = 0; i < 7; ++i)
+                obs_age_s = j["obs_age_s"].get<double>();
+                if (!std::isfinite(obs_age_s) || obs_age_s < 0.0 || obs_age_s > 5.0)
                 {
-                    std::cout << (i ? "," : "") << f[static_cast<std::size_t>(i)];
+                    obs_age_s = 0.0;
                 }
-                std::cout << std::endl;
             }
             {
                 std::lock_guard<std::mutex> lk(batch_mutex_);
                 target_q_batch_ = std::move(new_batch);
+                batch_obs_age_s_ = obs_age_s;
                 ++batch_commit_seq_;
             }
             send_line_to_client(client_sock,

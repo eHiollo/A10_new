@@ -4,9 +4,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
+#include <string>
 #include <vector>
 
 #include "a10_tcp_server.hpp"
@@ -25,6 +29,10 @@ namespace
 constexpr int k_follower_motor_base = 0;
 constexpr double k_control_hz = 500.0;
 constexpr double k_dt = 1.0 / k_control_hz;
+/// 这条策略的 10 步动作一共覆盖 0.33s，每步 0.033s。新 chunk 到达时按观测年龄丢掉已经过去的前缀。
+constexpr double k_action_chunk_horizon_s = 0.33;
+constexpr int k_action_chunk_steps = 10;
+constexpr double k_action_step_s = k_action_chunk_horizon_s / static_cast<double>(k_action_chunk_steps);
 
 struct JointSegment
 {
@@ -131,6 +139,110 @@ std::vector<double> lerp_q(const JointSegment& seg)
             + alpha * (seg.q1[static_cast<std::size_t>(i)] - seg.q0[static_cast<std::size_t>(i)]);
     }
     return q;
+}
+
+/// 每次接到新 batch 写一行，用来看关节方向有没有来回翻。只在换段时写，不在 500Hz 循环里写。
+void append_policy_rtc_trace(
+    const char* event,
+    std::uint64_t seq,
+    std::size_t remaining,
+    int n_steps,
+    double age_s,
+    int prefix_skip,
+    const std::vector<double>& q0,
+    const std::vector<double>& q1,
+    const std::vector<double>& actual)
+{
+    static std::ofstream out;
+    static bool ready = false;
+    static int prev_sign[6] = {};
+    static bool have_prev = false;
+    if (!ready)
+    {
+        std::error_code ec;
+        const std::filesystem::path path = "/home/kaanh/A10_new/log/policy_rtc_trace.csv";
+        std::filesystem::create_directories(path.parent_path(), ec);
+        const bool exists = std::filesystem::exists(path, ec) && std::filesystem::file_size(path, ec) > 0;
+        out.open(path, std::ios::app);
+        bool need_header = !exists;
+        if (out && exists)
+        {
+            std::ifstream in(path);
+            std::string header;
+            std::getline(in, header);
+            need_header = header.find("prefix_skip") == std::string::npos;
+        }
+        if (out && need_header)
+        {
+            out << "t_ms,event,seq,remaining,n_steps,age_s,prefix_skip";
+            for (int i = 0; i < 7; ++i)
+            {
+                out << ",q0_" << i;
+            }
+            for (int i = 0; i < 7; ++i)
+            {
+                out << ",q1_" << i;
+            }
+            for (int i = 0; i < 7; ++i)
+            {
+                out << ",dq_" << i;
+            }
+            for (int i = 0; i < 7; ++i)
+            {
+                out << ",act_" << i;
+            }
+            out << ",flip_axes\n";
+        }
+        ready = true;
+    }
+    if (!out)
+    {
+        return;
+    }
+
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    out << ms << ',' << event << ',' << seq << ',' << remaining << ',' << n_steps << ',';
+    out << std::fixed << std::setprecision(5);
+    out << age_s << ',' << prefix_skip;
+    auto emit7 = [&](const std::vector<double>& v) {
+        for (int i = 0; i < 7; ++i)
+        {
+            const double x = i < static_cast<int>(v.size()) ? v[static_cast<std::size_t>(i)] : 0.0;
+            out << ',' << x;
+        }
+    };
+    emit7(q0);
+    emit7(q1);
+    std::string flips;
+    for (int i = 0; i < 7; ++i)
+    {
+        const double a = i < static_cast<int>(q0.size()) ? q0[static_cast<std::size_t>(i)] : 0.0;
+        const double b = i < static_cast<int>(q1.size()) ? q1[static_cast<std::size_t>(i)] : 0.0;
+        const double dq = b - a;
+        out << ',' << dq;
+        if (i < 6)
+        {
+            const int sgn = (dq > 1e-4) ? 1 : ((dq < -1e-4) ? -1 : 0);
+            if (have_prev && sgn != 0 && prev_sign[i] != 0 && sgn != prev_sign[i])
+            {
+                if (!flips.empty())
+                {
+                    flips += '|';
+                }
+                flips += std::to_string(i);
+            }
+            if (sgn != 0)
+            {
+                prev_sign[i] = sgn;
+            }
+        }
+    }
+    have_prev = true;
+    emit7(actual);
+    out << ',' << flips << '\n';
+    out.flush();
 }
 
 void mout_vec7_line(aris::plan::Plan& plan, const char* label, const std::vector<double>& v)
@@ -250,6 +362,10 @@ struct A10PolicyTcpDriver::Imp
     bool has_last_batch_q1_{false};
     /// 当前正在插值的那一段所属的 batch_seq。中途 SET 替换队列时与 commit_seq 不一致，则从当前指令改接新队首。
     std::uint64_t segment_commit_seq_{0};
+    /// 已经按观测年龄丢掉过期前缀的 batch_seq。同一批只丢一次。
+    std::uint64_t prefix_aligned_seq_{0};
+    int last_prefix_skip_{0};
+    double last_prefix_age_s_{0.0};
     /// 一旦收到并执行过 policy batch，就不再回退到 legacy ``target_q_``，避免“走几步后回撤”。
     bool policy_batch_mode_{false};
 
@@ -261,6 +377,9 @@ struct A10PolicyTcpDriver::Imp
         last_logged_batch_commit_seq_ = 0;
         active_batch_commit_seq_ = 0;
         segment_commit_seq_ = 0;
+        prefix_aligned_seq_ = 0;
+        last_prefix_skip_ = 0;
+        last_prefix_age_s_ = 0.0;
         last_batch_q1_.clear();
         has_last_batch_q1_ = false;
         policy_batch_mode_ = false;
@@ -273,22 +392,21 @@ struct A10PolicyTcpDriver::Imp
             return;
         }
 
+        bool mid_retarget = false;
         if (batch_seg.active)
         {
             const std::uint64_t seq_now = g_tcp_server->policy_batch_commit_seq();
             if (seq_now != segment_commit_seq_)
             {
-                // SET_JOINTS_BATCH 整队替换：旧队首已不在队列。从当前指令姿态接到新队首，
-                // 不要 pop（否则会丢掉新 chunk 的 actions[0]）。
+                // SET_JOINTS_BATCH 整队替换：旧队首已不在队列。从当前指令姿态接到新队列里
+                // 还没过期的那一帧（下面按观测年龄丢掉前缀），不要在这里 pop。
                 last_batch_q1_ = lerp_q(batch_seg);
                 pad_seven(last_batch_q1_);
                 has_last_batch_q1_ = true;
                 batch_seg.active = false;
                 active_batch_commit_seq_ = seq_now;
                 segment_commit_seq_ = seq_now;
-                self.mout() << "policy: [batch] retarget mid-segment batch_seq=" << seq_now
-                             << " remaining=" << g_tcp_server->policy_batch_queue_size() << std::endl;
-                mout_vec7_line(self, "  blend_from_cmd=", last_batch_q1_);
+                mid_retarget = true;
             }
             else
             {
@@ -308,6 +426,24 @@ struct A10PolicyTcpDriver::Imp
         if (commit_seq_now != active_batch_commit_seq_)
         {
             active_batch_commit_seq_ = commit_seq_now;
+        }
+        if (commit_seq_now != prefix_aligned_seq_)
+        {
+            double age_s = 0.0;
+            const int applied = g_tcp_server->drop_policy_batch_prefix(commit_seq_now, k_action_step_s, &age_s);
+            if (applied < 0)
+            {
+                return;
+            }
+            prefix_aligned_seq_ = commit_seq_now;
+            last_prefix_skip_ = applied;
+            last_prefix_age_s_ = age_s;
+            if (applied > 0)
+            {
+                self.mout() << "policy: chunk 对齐 age=" << std::fixed << std::setprecision(3) << age_s
+                            << "s（每步 " << k_action_step_s << "s）丢掉前 " << applied
+                            << " 帧，从 actions[" << applied << "] 接" << std::defaultfloat << std::endl;
+            }
         }
         constexpr int k_max_batch_skips_per_tick = 64;
         int batch_skips = 0;
@@ -386,17 +522,18 @@ struct A10PolicyTcpDriver::Imp
             if (commit_seq != last_logged_batch_commit_seq_)
             {
                 last_logged_batch_commit_seq_ = commit_seq;
-                self.mout() << "policy: [batch] 新一批 keyframe#0 batch_seq=" << commit_seq << " remaining=" << rem
-                             << " n_steps=" << batch_seg.n_steps
-                             << " alpha@step0=" << segment_lerp_alpha(0, batch_seg.n_steps);
-                if (batch_skips > 0)
-                {
-                    self.mout() << " (本周期已跳过 " << batch_skips << " 个异常 keyframe)";
-                }
-                self.mout() << std::endl;
-                mout_vec7_line(self, "  q0(actual)=", batch_seg.q0);
-                mout_vec7_line(self, "  q1(queue_front)=", batch_seg.q1);
-                mout_vec7_line(self, "  first_cmd=", lerp_q(batch_seg));
+                const std::vector<double> actual = read_follower_seven(self);
+                append_policy_rtc_trace(
+                    mid_retarget ? "retarget" : "segment",
+                    commit_seq,
+                    rem,
+                    batch_seg.n_steps,
+                    last_prefix_age_s_,
+                    last_prefix_skip_,
+                    batch_seg.q0,
+                    batch_seg.q1,
+                    actual);
+                (void)batch_skips;
             }
             tick_segment_and_apply(batch_seg, self);
             if (!batch_seg.active)
