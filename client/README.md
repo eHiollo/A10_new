@@ -60,19 +60,51 @@ python3 run_bridge.py \
 
 ## 实机运行日志与耗时定位
 
-桥接程序默认在当前工作目录的 logs/ 写入两个文件：
+日志开关由**机器人终端的 policy 命令**控制：
 
-- vla_bridge.log：连接、告警、异常堆栈及原有每 20 轮动作摘要。
-- vla_timing.jsonl：每轮的 JSON 行事件。cycle_start 和 stage_start 可定位尚未返回的调用；cycle_end 包含各阶段毫秒耗时、结果和失败阶段。
+```text
+policy --log=1    # 开启本次 policy 的日志
+policy --log=0    # 关闭本次 policy 的日志
+policy           # 默认 log=1
+stop             # 停止 policy，桥接程序读到停止状态后关闭本次日志
+```
 
-建议进入 client/ 再启动，或用 --log-dir 指定绝对路径：
+先重新编译并重启机器人程序，使新增参数和状态接口生效：
 
-    cd client
-    python3 run_bridge.py --policy-host 192.168.110.119 --robot-host 127.0.0.1 --log-dir logs
+```bash
+cmake --build build --target kaanhbin -j2
+```
+
+构建会同步根目录 `kaanh.xml` 到 `build/bin/kaanh.xml`。如果启动机器人时指定了其他 XML，需要在该文件的 `A10PolicyTcpDriver/Command/GroupParam` 下增加 `<Param name="log" abbreviation="l" default="1"/>`。
+
+Python 桥接程序正常启动即可，不再接受 `--log` / `--no-log`；只保留 `--log-dir` 用于指定保存位置：
+
+```bash
+cd /home/kaanh/A10_new/client
+python3 run_bridge.py --policy-host 192.168.110.119 --robot-host 127.0.0.1
+# 可选：在原有启动参数上增加 --log-dir /指定的日志根目录
+```
+
+每次 policy 实际开始运行，机器人都会生成新的日志会话编号。桥接程序在每轮推理前和等待动作执行时读取 `GET_POLICY_STATUS`，依据其中的 `policy_running`、`log_enabled`、`log_session` 创建或关闭日志。因此即使 Python 一直运行，`stop` 后再次 `policy --log=1` 也会新建一组文件；`policy --log=0` 不创建日志目录。桥接程序自身重启后，也会为当前启用日志的 policy 新建一组文件。
+
+日志写在**运行 Python 桥接程序的电脑**上。默认根目录是启动命令所在目录下的 `logs/`；例如从 `/home/kaanh/A10_new/client` 启动，则每次会话目录为：
+
+```text
+/home/kaanh/A10_new/client/logs/run_20260928T060000_123456Z_pid12345_ab12cd34/
+  vla_bridge.log
+  vla_timing.jsonl
+```
+
+目录名包含桥接程序开始记录时的 UTC 时间、进程号和唯一后缀；终端会打印实际绝对路径和对应的机器人会话编号。
+
+- `vla_bridge.log`：连接、告警、异常堆栈及每 20 轮动作摘要。
+- `vla_timing.jsonl`：每轮阶段耗时，以及 `policy_session_start` / `policy_session_end` 会话事件，其中包含机器人会话编号。`cycle_start` 和 `stage_start` 可定位尚未返回的调用，`cycle_end` 记录结果和失败阶段。
+
+开关在桥接程序下一次收到状态回包时生效；若正在阻塞等待相机或推理结果，需等该调用返回后才能同步。执行期间发生 stop 或会话切换时，旧轮次剩余的耗时不会写入新会话。桥接程序启动但尚未观察到启用日志的 policy 时，仅保留终端输出；旧版本机器人缺少这些状态字段时，会提示升级，并保持文件日志关闭。
 
 cycle_end 中，state_ms 是机器人状态请求耗时；camera_ms 是相机取帧耗时；inference_ms 是发送观测至收到并解析推理结果的客户端耗时；server_infer_ms 是服务端返回的内部推理耗时（若有）；send_batch_ms 包含动作序列化和机器人确认；execute_wait_ms 包含轮询和实机执行等待；settle_ms 是配置的状态刷新等待。cycle_ms 是本轮总耗时，不含按 --hz 补足的节流时间。status_polls 是状态查询次数，image_bytes 是原始图像字节数。异常轮次记录 outcome=error、failed_stage 和 error_type；详细堆栈见普通日志。
 
-两个文件分别按 20 MiB 轮转，保留 5 份历史。时间戳为 UTC，耗时使用单调时钟。日志不保存图像或整段动作。机器人进程原有的控制台输出需在启动机器人时另行重定向保存，例如 ./build/bin/kaanhbin > robot.log 2>&1；本功能不会改变机器人实时控制线程的写盘路径。
+每次运行的两个文件分别按 20 MiB 轮转，各保留 5 份轮转文件；不同运行目录互不覆盖，旧运行目录不会自动删除。JSON 时间戳和目录名使用 UTC，普通文本日志使用本机时间，耗时使用单调时钟。日志不保存图像或整段动作。机器人进程原有的控制台输出需在启动机器人时另行重定向保存，例如 ./build/bin/kaanhbin > robot.log 2>&1；本功能不会改变机器人实时控制线程的写盘路径。
 
 ## 摄像头端口识别（抓图）
 

@@ -8,7 +8,7 @@ from runtime_logging import configure_logging
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
-    configure_logging(args.log_dir)
+    configure_logging(args.log_dir, enabled=False)
     run_from_args(args)
 
 

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
+#include <stdexcept>
 #include <vector>
 
 #include "a10_tcp_server.hpp"
@@ -232,6 +233,7 @@ bool legacy_target_changed(const std::vector<double>& tq, const std::vector<doub
 
 struct A10PolicyTcpDriver::Imp
 {
+    std::uint64_t log_session_token_{0};
     JointSegment batch_seg;
     JointSegment legacy_seg;
     std::vector<double> last_legacy_target;
@@ -426,6 +428,13 @@ struct A10PolicyTcpDriver::Imp
 
 auto A10PolicyTcpDriver::prepareNrt() -> void
 {
+    const double log_value = doubleParam("log");
+    if (log_value != 0.0 && log_value != 1.0)
+    {
+        throw std::invalid_argument("policy --log must be 0 or 1");
+    }
+    imp_->log_session_token_ = g_tcp_server
+        ? g_tcp_server->policy_log_state().prepare(log_value == 1.0) : 0;
     imp_->reset_motion_state();
     g_a10_policy_tcp_stop_requested.store(false, std::memory_order_release);
     for (auto& m : motorOptions())
@@ -476,8 +485,22 @@ auto A10PolicyTcpDriver::executeRT() -> int
         return 0;
     }
 
+    if (count() == 1)
+    {
+        g_tcp_server->policy_log_state().start(imp_->log_session_token_);
+        mout() << "policy: log=" << (doubleParam("log") == 1.0 ? 1 : 0)
+               << " session=" << (imp_->log_session_token_ >> 2) << std::endl;
+    }
     imp_->run_one_cycle(*this);
     return count();
+}
+
+auto A10PolicyTcpDriver::collectNrt() -> void
+{
+    if (g_tcp_server != nullptr)
+    {
+        g_tcp_server->policy_log_state().finish(imp_->log_session_token_);
+    }
 }
 
 A10PolicyTcpDriver::A10PolicyTcpDriver(const std::string& name) : imp_(new Imp)
@@ -486,6 +509,7 @@ A10PolicyTcpDriver::A10PolicyTcpDriver(const std::string& name) : imp_(new Imp)
         command(),
         "<Command name=\"policy\">"
         "  <GroupParam name=\"group_param\">"
+        "    <Param name=\"log\" abbreviation=\"l\" default=\"1\"/>"
         "    <Param name=\"arm_vel\" abbreviation=\"a\" default=\"0.05\"/>"
         "    <Param name=\"grip_vel\" abbreviation=\"g\" default=\"80\"/>"
         "    <Param name=\"max_axis_delta\" abbreviation=\"x\" default=\"0.5\"/>"
@@ -506,6 +530,10 @@ auto A10PolicyTcpCliStop::prepareNrt() -> void
 
     // vr/policy 持续占用 RT 时 executeRT 不会立刻执行；在 prepareNrt 置位，运行中的驱动下一拍即可退出。
     g_a10_policy_tcp_stop_requested.store(true, std::memory_order_release);
+    if (g_tcp_server != nullptr)
+    {
+        g_tcp_server->policy_log_state().stop();
+    }
     request_vr_teleop_stop();
     if (g_tcp_server != nullptr)
     {

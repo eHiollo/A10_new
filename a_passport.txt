@@ -27,6 +27,17 @@ cd /build
 cmake ..
 make -j4
 
+
+# VLA 桥接 公司端
+python run_bridge.py \
+  --policy-host 192.168.110.119 --policy-port 8000 \
+  --robot-host 127.0.0.1 --robot-port 8080 \
+  --hz 10 \
+  --top-camera 2 \
+  --right-camera 0
+
+# 开始控制
+policy --log=1 有日志
 阶段一：部署俊扬算法
 已完成：
     1.Jetson AGX Thor刷机与项目环境配置

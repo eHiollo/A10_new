@@ -1645,6 +1645,7 @@
             <A10PolicyTcpDriver name="plan">
                 <Command __prop_name__="command" name="policy">
                     <GroupParam name="group_param">
+                        <Param name="log" abbreviation="l" default="1"/>
                         <Param name="arm_vel" abbreviation="a" default="0.05"/>
                         <Param name="grip_vel" abbreviation="g" default="80"/>
                         <Param name="max_axis_delta" abbreviation="x" default="0.5"/>

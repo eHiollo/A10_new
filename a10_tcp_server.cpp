@@ -344,9 +344,13 @@ void A10TcpServer::send_policy_status(int client_sock)
         rem = target_q_batch_.size();
         seq = batch_commit_seq_;
     }
+    const auto log_state = policy_log_state_.snapshot();
     const char* idle_str = (rem == 0) ? "true" : "false";
     std::string payload = std::string("{\"idle\":") + idle_str + ",\"remaining\":" + std::to_string(rem)
-        + ",\"batch_seq\":" + std::to_string(seq) + "}\n";
+        + ",\"batch_seq\":" + std::to_string(seq)
+        + ",\"policy_running\":" + (log_state.running ? "true" : "false")
+        + ",\"log_enabled\":" + (log_state.enabled ? "true" : "false")
+        + ",\"log_session\":\"" + std::to_string(log_state.session) + "\"}\n";
 
     ssize_t total = 0;
     const char* buf = payload.c_str();

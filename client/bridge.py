@@ -11,7 +11,7 @@ import numpy as np
 
 from openpi_ws_client import OpenPIWebsocketClient
 from robot_tcp_client import RobotTcpClient
-from runtime_logging import record_timing_event
+from runtime_logging import PolicyLogSession, record_timing_event
 from usb_camera import CameraConfig, USBCamera
 
 logger = logging.getLogger(__name__)
@@ -73,12 +73,14 @@ class PiRobotBridge:
         right_cam: USBCamera,
         top_cam: USBCamera | None,
         cfg: BridgeConfig,
+        policy_logs: PolicyLogSession | None = None,
     ) -> None:
         self._ws = ws_client
         self._robot = robot_client
         self._right_cam = right_cam
         self._top_cam = top_cam
         self._cfg = cfg
+        self._policy_logs = policy_logs
 
     def _build_observation(self, state_7d: np.ndarray) -> dict[str, Any]:
         right_rgb = USBCamera.as_policy_hwc(self._right_cam.read_rgb())
@@ -120,18 +122,32 @@ class PiRobotBridge:
 
     def _run_cycle(self, infer_cycle: int) -> bool:
         """记录一轮端到端耗时；异常时也保留已完成阶段及失败阶段。"""
+        if self._policy_logs is not None:
+            try:
+                self._policy_logs.sync(self._robot.get_policy_status())
+            except Exception:
+                self._policy_logs.close(reason="status_unavailable")
+                raise
+        cycle_session = self._policy_logs.session_id if self._policy_logs else None
+
+        def emit(event: str, **fields: Any) -> None:
+            # A stop/restart during execution must not write this cycle to new files.
+            if self._policy_logs and self._policy_logs.session_id != cycle_session:
+                return
+            record_timing_event(event, **fields)
+
         started = time.perf_counter()
         metrics: dict[str, int | float | str] = {"cycle": infer_cycle}
         stage_name = "start"
         outcome = "error"
-        record_timing_event("cycle_start", cycle=infer_cycle)
+        emit("cycle_start", cycle=infer_cycle)
 
         @contextmanager
         def stage(name: str):
             nonlocal stage_name
             stage_name = name
             stage_started = time.perf_counter()
-            record_timing_event("stage_start", cycle=infer_cycle, stage=name)
+            emit("stage_start", cycle=infer_cycle, stage=name)
             try:
                 yield
             finally:
@@ -165,13 +181,16 @@ class PiRobotBridge:
                 metrics["status_polls"] = self._robot.wait_policy_idle(
                     poll_s=self._cfg.idle_poll_s,
                     timeout_s=self._cfg.idle_timeout_s,
+                    on_status=self._policy_logs.observe if self._policy_logs else None,
                 )
             if self._cfg.post_idle_settle_s > 0:
                 # batch 期间状态刷新可能暂停；等待一次刷新窗口。
                 with stage("settle"):
                     time.sleep(self._cfg.post_idle_settle_s)
 
-            if infer_cycle % 20 == 0:
+            if infer_cycle % 20 == 0 and (
+                self._policy_logs is None or self._policy_logs.session_id == cycle_session
+            ):
                 logger.info(
                     "infer_cycle=%d chunk_len=%d infer_ms=%s state=%s action[0]=%s",
                     infer_cycle,
@@ -188,11 +207,11 @@ class PiRobotBridge:
             raise
         finally:
             metrics["cycle_ms"] = round((time.perf_counter() - started) * 1000, 3)
-            record_timing_event("cycle_end", outcome=outcome, **metrics)
+            emit("cycle_end", outcome=outcome, **metrics)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Bridge OpenPI websocket inference with this repo's a10_tcp_server (TCP).")
+    parser = argparse.ArgumentParser(allow_abbrev=False, description="Bridge OpenPI websocket inference with this repo's a10_tcp_server (TCP).")
     parser.add_argument("--policy-host", type=str, default="192.168.110.119")
     parser.add_argument("--policy-port", type=int, default=8000)
     parser.add_argument("--policy-api-key", type=str, default=None)
@@ -249,7 +268,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--log-dir",
         type=str,
         default="logs",
-        help="运行日志目录（默认当前工作目录下的 logs；日志按大小轮转）。",
+        help="日志根目录（默认 logs）；记录开关由机器人 policy --log=1/0 控制，每次 policy 新建运行目录。",
     )
     parser.add_argument(
         "--start-delay",
@@ -293,11 +312,13 @@ def run_from_args(args: argparse.Namespace) -> None:
             )
         )
 
+    policy_logs = PolicyLogSession(args.log_dir)
     bridge = PiRobotBridge(
         ws_client=ws_client,
         robot_client=robot_client,
         right_cam=right_cam,
         top_cam=top_cam,
+        policy_logs=policy_logs,
         cfg=BridgeConfig(
             prompt=args.prompt,
             hz=float(args.hz),
@@ -312,6 +333,7 @@ def run_from_args(args: argparse.Namespace) -> None:
     try:
         bridge.run_forever()
     finally:
+        policy_logs.close(reason="bridge_exit")
         right_cam.close()
         if top_cam is not None:
             top_cam.close()

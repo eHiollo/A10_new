@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "a10_anchor_protocol.hpp"
+#include "a10_policy_log_state.hpp"
 
 /// Thread-safe TCP server for A10 robot (line-delimited JSON protocol).
 class A10TcpServer
@@ -38,6 +39,8 @@ public:
     std::size_t policy_batch_queue_size();
     std::uint64_t policy_batch_commit_seq();
     void clear_policy_tcp_targets_nrt();
+    a10_tcp::PolicyLogState& policy_log_state() { return policy_log_state_; }
+
 
     bool fetch_ee_delta_if_updated(
         std::vector<double>& out, std::uint64_t& out_seq, std::uint64_t consumed_seq);
@@ -73,6 +76,7 @@ private:
     std::mutex robot_q_mutex_;
     std::vector<double> robot_q_;
 
+    a10_tcp::PolicyLogState policy_log_state_;
     std::mutex batch_mutex_;
     std::deque<std::vector<double>> target_q_batch_;
     std::uint64_t batch_commit_seq_{0};
