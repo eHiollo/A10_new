@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import collections
 import logging
+from pathlib import Path
 import threading
 import time
 from dataclasses import dataclass
@@ -23,11 +24,9 @@ def _state_7d(values: list[float]) -> np.ndarray:
     不做归一化，quantile 统计在推理服务端。
     """
     arr = np.asarray(values, dtype=np.float32).reshape(-1)
-    if arr.shape[0] >= 7:
-        out = arr[:7]
-    else:
-        out = np.concatenate([arr, np.zeros((7 - arr.shape[0],), dtype=np.float32)], axis=0)
-    return np.ascontiguousarray(out, dtype=np.float32)
+    if arr.shape != (7,) or not np.isfinite(arr).all():
+        raise ValueError("Observation state must contain seven finite values")
+    return np.ascontiguousarray(arr, dtype=np.float32)
 
 
 def _extract_action_chunk(result: dict[str, Any], expected_dim: int = 7) -> np.ndarray:
@@ -49,6 +48,8 @@ def _extract_action_chunk(result: dict[str, Any], expected_dim: int = 7) -> np.n
 
     if actions.shape[-1] > expected_dim:
         actions = actions[:, :expected_dim]
+    if actions.shape[0] == 0 or not np.isfinite(actions).all():
+        raise ValueError("Policy returned empty or non-finite actions")
 
     # 服务端已把预测增量加回当前 state，并裁成 (T, 7)。这里原样下发，不要再加 state。
     return np.ascontiguousarray(actions, dtype=np.float32)
@@ -66,6 +67,8 @@ class BridgeConfig:
     mode: str = "async"
     buffer_target: int = 1
     infer_backoff_s: float = 0.005
+    prefetch_lead_s: float = 0.45
+    async_smoothing: bool = True
 
 
 class PiRobotBridge:
@@ -76,12 +79,15 @@ class PiRobotBridge:
         right_cam: USBCamera | ThreadedCamera,
         top_cam: USBCamera | ThreadedCamera | None,
         cfg: BridgeConfig,
+        runtime_log=None,
     ) -> None:
         self._ws = ws_client
         self._robot = robot_client
         self._right_cam = right_cam
         self._top_cam = top_cam
         self._cfg = cfg
+        self._log = runtime_log
+        self._infer_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._async_buffer: collections.deque[tuple[np.ndarray, float]] = collections.deque()
         self._async_buffer_lock = threading.Lock()
@@ -103,10 +109,27 @@ class PiRobotBridge:
         return _state_7d(self._robot.get_follower_state())
 
     def _infer_chunk(self, state_7d: np.ndarray) -> np.ndarray:
+        started = time.monotonic()
         obs = self._build_observation(state_7d)
+        observed = time.monotonic()
+        if self._log is not None:
+            self._log.save_observation_images(obs)
+        infer_started = time.monotonic()
         infer_result = self._ws.infer(obs)
         self._last_infer_result = infer_result
-        return _extract_action_chunk(infer_result, expected_dim=self._cfg.action_dim)
+        chunk = _extract_action_chunk(infer_result, expected_dim=self._cfg.action_dim)
+        if self._log is not None:
+            self._log.write("inference", state=state_7d, state_info=self._robot.last_state_info,
+                            cameras={"right": self._right_cam.last_frame_info,
+                                     "top": self._top_cam.last_frame_info if self._top_cam is not None else None},
+                            observation_ms=(observed - started) * 1000.0,
+                            inference_roundtrip_ms=(time.monotonic() - infer_started) * 1000.0,
+                            raw_action_shape=list(np.shape(infer_result["actions"])), actions=chunk,
+                            policy_timing=infer_result.get("policy_timing"),
+                            server_timing=infer_result.get("server_timing"),
+                            transport_timing=getattr(self._ws, "last_transport_timing", {}),
+                            action_delta_from_state=chunk[0] - state_7d)
+        return chunk
 
     def stop(self) -> None:
         self._stop.set()
@@ -114,10 +137,36 @@ class PiRobotBridge:
             self._async_buffer_not_empty.notify_all()
 
     def run_forever(self) -> None:
+        def monitor() -> None:
+            previous_running = None
+            while not self._stop.is_set():
+                try:
+                    status = self._robot.get_policy_status()
+                    running = status.get("policy_running")
+                    if running is not None and running != previous_running:
+                        logger.info("policy %s；bridge 保持运行。", "正在运行，允许下发新动作" if running else "未运行，继续取图/推理，暂不下发动作")
+                        if self._log is not None:
+                            self._log.write("policy_state_change", running=running)
+                        previous_running = running
+                except Exception as exc:
+                    if self._log is not None:
+                        self._log.write("status_error", error=repr(exc))
+                self._stop.wait(0.1)
+
+        monitor_thread = threading.Thread(target=monitor, daemon=True)
+        monitor_thread.start()
         if self._cfg.mode == "async":
-            self._run_async()
-        else:
-            self._run_sync()
+            logger.info("async 按推理完成速度换段；--hz 仅作用于 sync，不改变动作时间步。")
+        try:
+            if self._cfg.mode == "async":
+                self._run_async()
+            elif self._cfg.mode == "pipeline":
+                self._run_pipeline()
+            else:
+                self._run_sync()
+        finally:
+            self.stop()
+            monitor_thread.join(timeout=2.0)
 
     def _run_sync(self) -> None:
         """推理 → ``SET_JOINTS_BATCH`` → 等机器人逐步执行完 → 再采 obs / 下一轮推理。"""
@@ -138,8 +187,17 @@ class PiRobotBridge:
                     time.sleep(0.05)
                     continue
 
-                obs_age_s = time.perf_counter() - t_obs
-                queued = self._robot.send_policy_actions_batch(action_chunk, obs_age_s=obs_age_s)
+                inference_elapsed_s = time.perf_counter() - t_obs
+                if self._robot.get_policy_status().get("policy_running") is False:
+                    self._stop.wait(0.1)
+                    continue
+                # sync 模式下，推理期间机器人保持在上一批终点，动作时间轴尚未开始。
+                # 不把推理耗时作为轨迹年龄，否则 0.38s 会错误裁掉约 11 个 30Hz 动作。
+                queued = self._robot.send_policy_actions_batch(action_chunk, obs_age_s=None)
+                if self._log is not None:
+                    self._log.write("sync_send", cycle=infer_cycle, queued=queued,
+                                    inference_elapsed_s=inference_elapsed_s,
+                                    obs_age_s_sent=None, ack=self._robot.last_batch_ack)
                 wait_st = self._robot.wait_policy_idle(
                     poll_s=self._cfg.idle_poll_s,
                     timeout_s=self._cfg.idle_timeout_s,
@@ -147,8 +205,9 @@ class PiRobotBridge:
                     expected_queued=queued,
                 )
                 if wait_st == "skipped":
-                    logger.error("sync: 机器人一拍跳过了当前 batch（未插值）。停止发送后续 chunk。")
-                    break
+                    logger.warning("sync: batch 被丢弃或 policy 已停止，bridge 保持运行。")
+                    self._stop.wait(0.2)
+                    continue
                 if wait_st == "stopped" or self._stop.is_set():
                     break
                 if self._cfg.post_idle_settle_s > 0:
@@ -165,15 +224,94 @@ class PiRobotBridge:
                         np.array2string(action_chunk[0], precision=4, suppress_small=True),
                     )
                 infer_cycle += 1
-            except Exception:  # noqa: BLE001
-                logger.exception("Bridge sync step failed. Retrying next cycle.")
-                time.sleep(0.2)
+            except Exception as exc:
+                logger.exception("Bridge sync step failed; will retry.")
+                if self._log is not None:
+                    self._log.write("inference_error", error=repr(exc))
+                self._stop.wait(0.5)
 
             if infer_period_s > 0:
                 elapsed = time.time() - t_cycle
                 remain = infer_period_s - elapsed
                 if remain > 0:
                     time.sleep(remain)
+
+    def _wait_pipeline_window(self, lead_s: float) -> dict | None:
+        while not self._stop.is_set():
+            status = self._robot.get_policy_status()
+            if status.get("policy_running") is False or int(status.get("remaining", 0)) == 0:
+                return status
+            remaining_s = status.get("remaining_time_s", -1.0)
+            if remaining_s >= 0.0 and remaining_s <= lead_s:
+                return status
+            if "remaining_time_s" not in status and not getattr(self, "_pipeline_fallback_warned", False):
+                logger.warning("控制器缺少剩余执行时间，pipeline 暂按 sync 等待；重启新编译的控制器后可提前推理。")
+                self._pipeline_fallback_warned = True
+            self._stop.wait(max(0.01, self._cfg.idle_poll_s))
+        return None
+
+    def _wait_pipeline_boundary(self, expected_seq: int, deadline: float) -> dict | None:
+        while not self._stop.is_set():
+            status = self._robot.get_policy_status()
+            reason = None
+            if status.get("policy_running") is False:
+                reason = "policy_stopped"
+            elif int(status.get("batch_seq", 0)) != expected_seq:
+                reason = "batch_changed"
+            elif time.perf_counter() >= deadline:
+                reason = "prediction_expired"
+            if reason is not None:
+                if self._log is not None:
+                    self._log.write("pipeline_discard", reason=reason, expected_batch_seq=expected_seq, status=status)
+                return None
+            if int(status.get("remaining", 0)) == 0 and not status.get("motion_settling", False):
+                return status
+            self._stop.wait(max(0.005, self._cfg.idle_poll_s))
+        return None
+
+    def _run_pipeline(self) -> None:
+        latencies: collections.deque[float] = collections.deque(maxlen=20)
+        horizon_s = 1.0
+        logger.info("pipeline：尾段预取，旧 batch 完成后衔接；初始提前量 %.3fs。", self._cfg.prefetch_lead_s)
+        self._stop.wait(self._cfg.start_delay_s)
+        while not self._stop.is_set():
+            try:
+                measured_lead = float(np.percentile(latencies, 95)) + 0.05 if latencies else 0.0
+                lead_s = min(horizon_s * 0.8, max(self._cfg.prefetch_lead_s, measured_lead))
+                before = self._wait_pipeline_window(lead_s)
+                if before is None:
+                    break
+                expected_seq = int(before.get("batch_seq", 0))
+                if self._log is not None:
+                    self._log.write("pipeline_prefetch", lead_s=lead_s, status=before)
+                observed_at = time.perf_counter()
+                state = self._obs_state_7d()
+                chunk = self._infer_chunk(state)
+                inferred_at = time.perf_counter()
+                horizon_s = len(chunk) * float(before.get("action_step_s", 1.0 / 30.0))
+                inference_s = inferred_at - observed_at
+                if inference_s < horizon_s:
+                    latencies.append(inference_s)
+                if before.get("policy_running") is False:
+                    if self._log is not None:
+                        self._log.write("idle_prediction", chunk_len=len(chunk), obs_age_s=inference_s)
+                    continue
+                boundary = self._wait_pipeline_boundary(expected_seq, observed_at + horizon_s)
+                if boundary is None or self._stop.is_set():
+                    continue
+                obs_age_s = time.perf_counter() - observed_at
+                queued = self._robot.send_policy_actions_batch(chunk, obs_age_s=obs_age_s, expected_batch_seq=expected_seq)
+                if self._log is not None:
+                    self._log.write("pipeline_send", queued=queued, obs_age_s=obs_age_s,
+                                    remaining_before_inference=before.get("remaining"),
+                                    estimated_remaining_s=before.get("remaining_time_s"),
+                                    wait_for_boundary_s=time.perf_counter() - inferred_at,
+                                    ack=self._robot.last_batch_ack)
+            except Exception as exc:
+                logger.exception("pipeline step failed; will retry.")
+                if self._log is not None:
+                    self._log.write("pipeline_error", error=repr(exc))
+                self._stop.wait(0.5)
 
     def _run_async(self) -> None:
         """执行中采观测并推理，下一段到达后替换还没走完的队列。
@@ -200,13 +338,18 @@ class PiRobotBridge:
                     state_7d = self._obs_state_7d()
                     chunk = self._infer_chunk(state_7d)
                     with buffer_lock:
+                        if self._stop.is_set():
+                            return
                         buffer.append((chunk, t_obs))
                         buffer_not_empty.notify()
-                except Exception:  # noqa: BLE001
+                except Exception as exc:
                     logger.exception("async inferencer step failed.")
-                    time.sleep(0.2)
+                    if self._log is not None:
+                        self._log.write("inference_error", error=repr(exc))
+                    self._stop.wait(0.5)
 
         infer_thread = threading.Thread(target=inferencer, daemon=True)
+        self._infer_thread = infer_thread
         infer_thread.start()
         with buffer_lock:
             while len(buffer) == 0 and not self._stop.is_set():
@@ -231,13 +374,21 @@ class PiRobotBridge:
                     logger.warning("async: chunk 为空，跳过。")
                     continue
 
-                rem_before = -1
-                try:
-                    rem_before = int(self._robot.get_policy_status().get("remaining") or 0)
-                except Exception:  # noqa: BLE001
-                    rem_before = -1
+                status = self._robot.get_policy_status()
+                if status.get("policy_running") is False:
+                    if self._log is not None:
+                        self._log.write("idle_prediction", chunk_len=n, obs_age_s=time.perf_counter() - t_obs)
+                    continue
+                rem_before = int(status.get("remaining") or 0)
                 obs_age_s = time.perf_counter() - t_obs
-                queued = self._robot.send_policy_actions_batch(action_chunk, obs_age_s=obs_age_s)
+                smooth = self._cfg.async_smoothing and status.get("supports_async_smoothing") is True
+                if self._cfg.async_smoothing and not smooth and not getattr(self, "_smoothing_warned", False):
+                    logger.warning("控制器不支持异步平滑，暂按原逻辑执行；停止机器人并重启新编译的控制器后生效。")
+                    self._smoothing_warned = True
+                queued = self._robot.send_policy_actions_batch(action_chunk, obs_age_s=obs_age_s, smooth=smooth)
+                if self._log is not None:
+                    self._log.write("async_send", cycle=infer_cycle, remaining_before=rem_before,
+                                    queued=queued, obs_age_s=obs_age_s, smooth=smooth, ack=self._robot.last_batch_ack)
                 if infer_cycle > 0 and rem_before <= 0:
                     logger.warning(
                         "async: cycle=%d rem_before=%s 队列已空才发下一段（没有叠上执行）",
@@ -257,13 +408,18 @@ class PiRobotBridge:
                         np.array2string(action_chunk[0], precision=4, suppress_small=True),
                     )
                 infer_cycle += 1
-            except Exception:  # noqa: BLE001
+            except Exception as exc:
                 logger.exception("async pusher step failed.")
-                time.sleep(0.2)
+                if self._log is not None:
+                    self._log.write("transport_error", error=repr(exc))
+                self._stop.wait(0.5)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Bridge OpenPI websocket inference with this repo's a10_tcp_server (TCP).")
+    parser.add_argument("--log-dir", default=str(Path(__file__).resolve().parent / "logs"), help="每次运行创建独立日志目录。")
+    parser.add_argument("--camera-max-age", type=float, default=0.5, help="仅日志标记：相机缓存帧过旧阈值（秒），不阻止 bridge 运行。")
+    parser.add_argument("--infer-timeout", type=float, default=60.0, help="推理回包超时（秒），需包含首次预热。")
     parser.add_argument("--policy-host", type=str, default="192.168.110.119")
     parser.add_argument("--policy-port", type=int, default=8000)
     parser.add_argument("--policy-api-key", type=str, default=None)
@@ -277,14 +433,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--right-camera",
         type=str,
-        default="2",
-        help="右腕 / wrist 相机（默认 video2，即索引 2 或 /dev/video2）。",
+        default="0",
+        help="右腕 / wrist 相机（公司实机已确认默认 video0，即索引 0 或 /dev/video0）。",
     )
     parser.add_argument(
         "--top-camera",
         type=str,
-        default="0",
-        help="顶视 / third-person 相机（默认 video0），对应 observation/images/top。传空字符串则不发这一路，服务端按没看到处理。",
+        default="2",
+        help="顶视 / third-person 相机（公司实机已确认默认 video2），对应 observation/images/top。传空字符串则不发这一路，服务端按没看到处理。",
     )
     parser.add_argument(
         "--right-rotate-180",
@@ -305,7 +461,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--hz",
         type=float,
         default=10.0,
-        help="整轮（推理 + batch 执行完 + wait idle）之间的节流：每轮结束后至少间隔 1/hz 秒；0 为不节流。",
+        help="仅 sync：整轮最小周期为 1/hz 秒；async 不使用此参数，也不改变控制器的动作时间步。",
     )
     parser.add_argument("--idle-poll", type=float, default=0.005, help="轮询 GET_POLICY_STATUS 的间隔（秒）。")
     parser.add_argument("--idle-timeout", type=float, default=120.0, help="等待 batch 执行完的最长时间（秒）。")
@@ -324,10 +480,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=["async", "sync"],
+        choices=["async", "sync", "pipeline"],
         default="async",
-        help="async=执行中推理并替换未走完的队列；sync=走完再推理。",
+        help="async=执行中不断替换；sync=走完再推理；pipeline=尾段提前推理、走完再衔接。",
     )
+    parser.add_argument("--prefetch-lead", type=float, default=0.45, help="pipeline 提前推理的初始秒数，会按实测推理耗时调整。")
+    parser.add_argument("--async-smoothing", action=argparse.BooleanOptionalAction, default=True,
+                        help="async 使用控制器加速度受限衔接；--no-async-smoothing 恢复原插值供对照。")
     parser.add_argument(
         "--camera-mode",
         choices=["threaded", "exclusive"],
@@ -343,27 +502,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _make_camera(source: str, width: int, height: int, rotate_180: bool, camera_mode: str, exclusive: bool):
+def _make_camera(source: str, width: int, height: int, rotate_180: bool, camera_mode: str, exclusive: bool, max_age_s: float = 0.5):
     cfg = CameraConfig(
         source=source,
         width=width,
         height=height,
         rotate_180=rotate_180,
         exclusive_per_read=exclusive,
+        max_frame_age_s=max_age_s,
     )
     if camera_mode == "threaded":
         return ThreadedCamera(cfg)
     return USBCamera(cfg)
 
 
-def run_from_args(args: argparse.Namespace) -> None:
+def run_from_args(args: argparse.Namespace, runtime_log=None) -> None:
+    if args.action_dim != 7:
+        raise ValueError("This robot requires --action-dim 7")
+    if not np.isfinite(args.camera_max_age) or args.camera_max_age <= 0:
+        raise ValueError("--camera-max-age must be positive and finite")
+    if not np.isfinite(args.infer_timeout) or args.infer_timeout <= 0:
+        raise ValueError("--infer-timeout must be positive and finite")
+    if not np.isfinite(args.prefetch_lead) or args.prefetch_lead <= 0:
+        raise ValueError("--prefetch-lead must be positive and finite")
     ws_client = OpenPIWebsocketClient(
         host=args.policy_host,
         port=args.policy_port,
         api_key=args.policy_api_key,
+        infer_timeout_s=args.infer_timeout,
     )
-    robot_client = RobotTcpClient(host=args.robot_host, port=args.robot_port)
+    robot_client = RobotTcpClient(host=args.robot_host, port=args.robot_port, runtime_log=runtime_log)
     robot_client.connect()
+    if runtime_log is not None:
+        runtime_log.write("policy_metadata", metadata=ws_client.server_metadata)
 
     use_dual_cam = isinstance(args.top_camera, str) and args.top_camera.strip()
     exclusive = bool(use_dual_cam) and args.camera_mode == "exclusive"
@@ -374,6 +545,7 @@ def run_from_args(args: argparse.Namespace) -> None:
         bool(args.right_rotate_180),
         args.camera_mode,
         exclusive,
+        args.camera_max_age,
     )
     top_cam = None
     if use_dual_cam:
@@ -384,6 +556,7 @@ def run_from_args(args: argparse.Namespace) -> None:
             bool(args.top_rotate_180),
             args.camera_mode,
             exclusive,
+            args.camera_max_age,
         )
 
     bridge = PiRobotBridge(
@@ -401,29 +574,33 @@ def run_from_args(args: argparse.Namespace) -> None:
             post_idle_settle_s=max(0.0, float(args.post_idle_settle)),
             mode=str(args.mode),
             buffer_target=max(1, int(args.buffer_target)),
+            async_smoothing=bool(args.async_smoothing),
+            prefetch_lead_s=args.prefetch_lead,
         ),
+        runtime_log=runtime_log,
     )
-
-    interrupted = False
 
     def _shutdown() -> None:
         bridge.stop()
-        if interrupted:
-            logger.info("正在停止桥接：请求机器人 STOP_POLICY 并关闭连接...")
-            try:
-                robot_client.stop_policy()
-            except Exception:  # noqa: BLE001
-                logger.warning("STOP_POLICY 发送失败（可能连接已断）。")
+        logger.info("正在停止桥接：请求机器人 STOP_POLICY 并关闭连接...")
+        try:
+            robot_client.stop_policy()
+            robot_client.get_policy_status()
+        except Exception:
+            logger.exception("STOP_POLICY 或最终状态查询失败，请使用控制器 stop / 现场急停。")
+            if runtime_log is not None:
+                runtime_log.write("stop_failed")
+        ws_client.close()
+        if bridge._infer_thread is not None:
+            bridge._infer_thread.join(timeout=2.0)
         right_cam.close()
         if top_cam is not None:
             top_cam.close()
         robot_client.close()
-        ws_client.close()
 
     try:
         bridge.run_forever()
     except KeyboardInterrupt:
-        interrupted = True
         logger.info("收到 Ctrl+C，开始优雅停止。")
     finally:
         _shutdown()

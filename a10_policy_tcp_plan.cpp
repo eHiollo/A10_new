@@ -7,13 +7,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <filesystem>
-#include <fstream>
 #include <iomanip>
 #include <string>
 #include <vector>
 
 #include "a10_tcp_server.hpp"
+#include "a10_policy_smoother.hpp"
 #include "a10_vr_plan.hpp"
 #include "a10_gripper_bridge.hpp"
 
@@ -29,9 +28,9 @@ namespace
 constexpr int k_follower_motor_base = 0;
 constexpr double k_control_hz = 500.0;
 constexpr double k_dt = 1.0 / k_control_hz;
-/// 这条策略的 10 步动作一共覆盖 0.33s，每步 0.033s。新 chunk 到达时按观测年龄丢掉已经过去的前缀。
-constexpr double k_action_chunk_horizon_s = 0.33;
-constexpr int k_action_chunk_steps = 10;
+/// 这条策略的 30 步动作一共覆盖 1s，每步约 0.033s。新 chunk 到达时按观测年龄丢掉已经过去的前缀。
+constexpr double k_action_chunk_horizon_s = 1.0;
+constexpr int k_action_chunk_steps = 30;
 constexpr double k_action_step_s = k_action_chunk_horizon_s / static_cast<double>(k_action_chunk_steps);
 
 struct JointSegment
@@ -102,20 +101,7 @@ void pad_seven(std::vector<double>& v)
 
 int blend_steps_seven(const std::vector<double>& q0, const std::vector<double>& q1, double max_arm_vel, double max_grip_vel)
 {
-    int n = 1;
-    for (int i = 0; i < 6; ++i)
-    {
-        const double dq = std::abs(q1[static_cast<std::size_t>(i)] - q0[static_cast<std::size_t>(i)]);
-        const int steps = static_cast<int>(std::ceil(dq / (max_arm_vel * k_dt)));
-        n = std::max(n, std::max(1, steps));
-    }
-    if (q0.size() >= 7 && q1.size() >= 7)
-    {
-        const double dq = std::abs(q1[6] - q0[6]);
-        const int steps = static_cast<int>(std::ceil(dq / (max_grip_vel * k_dt)));
-        n = std::max(n, std::max(1, steps));
-    }
-    return n;
+    return policy_blend_steps(q0, q1, max_arm_vel, max_grip_vel);
 }
 
 /// 段内插值系数：``n_steps<=1`` 时单拍直达 ``q1``；否则 ``step_idx==0`` 时 ``alpha=0`` 落在 ``q0``，
@@ -141,7 +127,6 @@ std::vector<double> lerp_q(const JointSegment& seg)
     return q;
 }
 
-/// 每次接到新 batch 写一行，用来看关节方向有没有来回翻。只在换段时写，不在 500Hz 循环里写。
 void append_policy_rtc_trace(
     const char* event,
     std::uint64_t seq,
@@ -151,98 +136,29 @@ void append_policy_rtc_trace(
     int prefix_skip,
     const std::vector<double>& q0,
     const std::vector<double>& q1,
-    const std::vector<double>& actual)
+    const std::vector<double>& actual,
+    double arm_vel,
+    double grip_vel,
+    double max_axis_delta,
+    double max_grip_delta)
 {
-    static std::ofstream out;
-    static bool ready = false;
-    static int prev_sign[6] = {};
-    static bool have_prev = false;
-    if (!ready)
-    {
-        std::error_code ec;
-        const std::filesystem::path path = "/home/kaanh/A10_new/log/policy_rtc_trace.csv";
-        std::filesystem::create_directories(path.parent_path(), ec);
-        const bool exists = std::filesystem::exists(path, ec) && std::filesystem::file_size(path, ec) > 0;
-        out.open(path, std::ios::app);
-        bool need_header = !exists;
-        if (out && exists)
-        {
-            std::ifstream in(path);
-            std::string header;
-            std::getline(in, header);
-            need_header = header.find("prefix_skip") == std::string::npos;
-        }
-        if (out && need_header)
-        {
-            out << "t_ms,event,seq,remaining,n_steps,age_s,prefix_skip";
-            for (int i = 0; i < 7; ++i)
-            {
-                out << ",q0_" << i;
-            }
-            for (int i = 0; i < 7; ++i)
-            {
-                out << ",q1_" << i;
-            }
-            for (int i = 0; i < 7; ++i)
-            {
-                out << ",dq_" << i;
-            }
-            for (int i = 0; i < 7; ++i)
-            {
-                out << ",act_" << i;
-            }
-            out << ",flip_axes\n";
-        }
-        ready = true;
-    }
-    if (!out)
-    {
+    if (g_tcp_server == nullptr)
         return;
-    }
-
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch())
-                        .count();
-    out << ms << ',' << event << ',' << seq << ',' << remaining << ',' << n_steps << ',';
-    out << std::fixed << std::setprecision(5);
-    out << age_s << ',' << prefix_skip;
-    auto emit7 = [&](const std::vector<double>& v) {
-        for (int i = 0; i < 7; ++i)
-        {
-            const double x = i < static_cast<int>(v.size()) ? v[static_cast<std::size_t>(i)] : 0.0;
-            out << ',' << x;
-        }
-    };
-    emit7(q0);
-    emit7(q1);
-    std::string flips;
-    for (int i = 0; i < 7; ++i)
-    {
-        const double a = i < static_cast<int>(q0.size()) ? q0[static_cast<std::size_t>(i)] : 0.0;
-        const double b = i < static_cast<int>(q1.size()) ? q1[static_cast<std::size_t>(i)] : 0.0;
-        const double dq = b - a;
-        out << ',' << dq;
-        if (i < 6)
-        {
-            const int sgn = (dq > 1e-4) ? 1 : ((dq < -1e-4) ? -1 : 0);
-            if (have_prev && sgn != 0 && prev_sign[i] != 0 && sgn != prev_sign[i])
-            {
-                if (!flips.empty())
-                {
-                    flips += '|';
-                }
-                flips += std::to_string(i);
-            }
-            if (sgn != 0)
-            {
-                prev_sign[i] = sgn;
-            }
-        }
-    }
-    have_prev = true;
-    emit7(actual);
-    out << ',' << flips << '\n';
-    out.flush();
+    A10PolicyTrace trace;
+    trace.event = event;
+    trace.sequence = seq;
+    trace.remaining = remaining;
+    trace.n_steps = n_steps;
+    trace.age_s = age_s;
+    trace.prefix_skip = prefix_skip;
+    trace.arm_vel = arm_vel;
+    trace.grip_vel = grip_vel;
+    trace.max_axis_delta = max_axis_delta;
+    trace.max_grip_delta = max_grip_delta;
+    std::copy_n(q0.begin(), std::min(q0.size(), trace.q0.size()), trace.q0.begin());
+    std::copy_n(q1.begin(), std::min(q1.size(), trace.q1.size()), trace.q1.begin());
+    std::copy_n(actual.begin(), std::min(actual.size(), trace.actual.size()), trace.actual.begin());
+    g_tcp_server->record_policy_trace(trace);
 }
 
 void mout_vec7_line(aris::plan::Plan& plan, const char* label, const std::vector<double>& v)
@@ -281,9 +197,12 @@ void start_segment(
     seg.active = true;
 }
 
-void tick_segment_and_apply(JointSegment& seg, aris::plan::Plan& plan)
+void tick_segment_and_apply(JointSegment& seg, aris::plan::Plan& plan, std::vector<double>* reference = nullptr)
 {
-    apply_seven_to_motors(plan, lerp_q(seg));
+    if (reference != nullptr)
+        *reference = lerp_q(seg);
+    else
+        apply_seven_to_motors(plan, lerp_q(seg));
     seg.step_idx++;
     if (seg.step_idx >= seg.n_steps)
     {
@@ -368,6 +287,17 @@ struct A10PolicyTcpDriver::Imp
     double last_prefix_age_s_{0.0};
     /// 一旦收到并执行过 policy batch，就不再回退到 legacy ``target_q_``，避免“走几步后回撤”。
     bool policy_batch_mode_{false};
+    std::uint64_t previous_cycle_ns_{0};
+    double max_control_period_us_{0.0};
+    double max_control_work_us_{0.0};
+    PolicyCommandSmoother smoother_;
+    std::vector<double> reference_command_;
+    std::vector<double> previous_command_;
+    std::array<double, 6> previous_velocity_{};
+    bool smoothing_{false};
+    double max_arm_acc_{0.5};
+    double max_command_vel_{0.0};
+    double max_command_acc_{0.0};
 
     void reset_motion_state()
     {
@@ -383,6 +313,15 @@ struct A10PolicyTcpDriver::Imp
         last_batch_q1_.clear();
         has_last_batch_q1_ = false;
         policy_batch_mode_ = false;
+        previous_cycle_ns_ = 0;
+        max_control_period_us_ = 0.0;
+        max_control_work_us_ = 0.0;
+        reference_command_.clear();
+        previous_command_.clear();
+        previous_velocity_.fill(0.0);
+        smoothing_ = false;
+        max_command_vel_ = 0.0;
+        max_command_acc_ = 0.0;
     }
 
     void run_one_cycle(A10PolicyTcpDriver& self)
@@ -400,7 +339,8 @@ struct A10PolicyTcpDriver::Imp
             {
                 // SET_JOINTS_BATCH 整队替换：旧队首已不在队列。从当前指令姿态接到新队列里
                 // 还没过期的那一帧（下面按观测年龄丢掉前缀），不要在这里 pop。
-                last_batch_q1_ = lerp_q(batch_seg);
+                batch_seg.step_idx = std::max(0, batch_seg.step_idx - 1);
+                last_batch_q1_ = smoothing_ ? smoother_.position() : lerp_q(batch_seg);
                 pad_seven(last_batch_q1_);
                 has_last_batch_q1_ = true;
                 batch_seg.active = false;
@@ -410,10 +350,10 @@ struct A10PolicyTcpDriver::Imp
             }
             else
             {
-                tick_segment_and_apply(batch_seg, self);
+                tick_segment_and_apply(batch_seg, self, &reference_command_);
                 if (!batch_seg.active)
                 {
-                    g_tcp_server->pop_policy_batch_front();
+                    g_tcp_server->pop_policy_batch_front(segment_commit_seq_);
                 }
                 return;
             }
@@ -429,15 +369,31 @@ struct A10PolicyTcpDriver::Imp
         }
         if (commit_seq_now != prefix_aligned_seq_)
         {
+            policy_batch_mode_ = true;
             double age_s = 0.0;
             const int applied = g_tcp_server->drop_policy_batch_prefix(commit_seq_now, k_action_step_s, &age_s);
             if (applied < 0)
             {
                 return;
             }
+            const auto batch_status = g_tcp_server->policy_batch_status();
+            if (batch_status.sequence != commit_seq_now)
+                return;
+            if (batch_status.smooth && !smoothing_)
+            {
+                auto command = read_follower_seven(self);
+                auto& motors = self.controller()->motorPool();
+                for (std::size_t axis = 0; axis < 6 && axis < motors.size(); ++axis)
+                    command[axis] = motors[axis].targetPos();
+                smoother_.reset(command);
+            }
+            smoothing_ = batch_status.smooth;
             prefix_aligned_seq_ = commit_seq_now;
             last_prefix_skip_ = applied;
             last_prefix_age_s_ = age_s;
+            append_policy_rtc_trace("align", commit_seq_now, g_tcp_server->policy_batch_queue_size(),
+                0, age_s, applied, {}, {}, read_follower_seven(self),
+                max_arm_vel_rad_s, max_gripper_vel, max_axis_delta_rad_, max_grip_delta_);
             if (applied > 0)
             {
                 self.mout() << "policy: chunk 对齐 age=" << std::fixed << std::setprecision(3) << age_s
@@ -450,7 +406,7 @@ struct A10PolicyTcpDriver::Imp
         bool have_valid_batch_goal = false;
         for (int attempt = 0; attempt < k_max_batch_skips_per_tick; ++attempt)
         {
-            if (!g_tcp_server->peek_policy_batch_front(batch_goal))
+            if (!g_tcp_server->peek_policy_batch_front(batch_goal, commit_seq_now))
             {
                 break;
             }
@@ -478,7 +434,11 @@ struct A10PolicyTcpDriver::Imp
                 mout_vec7_line(self, "  q0(actual)=", q0snap);
             }
             mout_vec7_line(self, "  skipped q1=", batch_goal);
-            g_tcp_server->pop_policy_batch_front();
+            append_policy_rtc_trace("threshold_skip", commit_seq_now, g_tcp_server->policy_batch_queue_size(),
+                0, last_prefix_age_s_, last_prefix_skip_, q0check, batch_goal, q0snap,
+                max_arm_vel_rad_s, max_gripper_vel, max_axis_delta_rad_, max_grip_delta_);
+            if (!g_tcp_server->pop_policy_batch_front(commit_seq_now))
+                return;
             ++batch_skips;
             batch_goal.clear();
         }
@@ -486,7 +446,7 @@ struct A10PolicyTcpDriver::Imp
         if (!have_valid_batch_goal)
         {
             std::vector<double> probe;
-            if (g_tcp_server->peek_policy_batch_front(probe))
+            if (g_tcp_server->peek_policy_batch_front(probe, commit_seq_now))
             {
                 pad_seven(probe);
                 std::vector<double> q0snap = read_follower_seven(self);
@@ -511,11 +471,14 @@ struct A10PolicyTcpDriver::Imp
         {
             policy_batch_mode_ = true;
             pad_seven(batch_goal);
-            const std::uint64_t commit_seq = g_tcp_server->policy_batch_commit_seq();
+            const std::uint64_t commit_seq = commit_seq_now;
+            if (g_tcp_server->policy_batch_commit_seq() != commit_seq)
+                return;
             const std::size_t rem = g_tcp_server->policy_batch_queue_size();
             const std::vector<double>* q0_seed = has_last_batch_q1_ ? &last_batch_q1_ : nullptr;
-            // batch 段间衔接最少 2 个实时周期，避免单拍跳变导致的“顿挫”。
-            start_segment(batch_seg, batch_goal, self, max_arm_vel_rad_s, max_gripper_vel, q0_seed, 2);
+            const double handoff_s = commit_seq != last_logged_batch_commit_seq_ ? last_prefix_age_s_ : 0.0;
+            start_segment(batch_seg, batch_goal, self, max_arm_vel_rad_s, max_gripper_vel,
+                q0_seed, policy_min_segment_steps(smoothing_, handoff_s));
             last_batch_q1_ = batch_seg.q1;
             has_last_batch_q1_ = true;
             segment_commit_seq_ = commit_seq;
@@ -532,13 +495,14 @@ struct A10PolicyTcpDriver::Imp
                     last_prefix_skip_,
                     batch_seg.q0,
                     batch_seg.q1,
-                    actual);
+                    actual,
+                    max_arm_vel_rad_s, max_gripper_vel, max_axis_delta_rad_, max_grip_delta_);
                 (void)batch_skips;
             }
-            tick_segment_and_apply(batch_seg, self);
+            tick_segment_and_apply(batch_seg, self, &reference_command_);
             if (!batch_seg.active)
             {
-                g_tcp_server->pop_policy_batch_front();
+                g_tcp_server->pop_policy_batch_front(segment_commit_seq_);
             }
             return;
         }
@@ -585,7 +549,11 @@ struct A10PolicyTcpDriver::Imp
 
 auto A10PolicyTcpDriver::prepareNrt() -> void
 {
+    const double arm_acc = cmdParams().find("arm_acc") == cmdParams().end() ? 0.5 : doubleParam("arm_acc");
+    if (!std::isfinite(arm_acc) || arm_acc <= 0.0)
+        throw std::invalid_argument("arm_acc must be finite and positive");
     imp_->reset_motion_state();
+    imp_->max_arm_acc_ = arm_acc;
     g_a10_policy_tcp_stop_requested.store(false, std::memory_order_release);
     for (auto& m : motorOptions())
     {
@@ -601,6 +569,11 @@ auto A10PolicyTcpDriver::executeRT() -> int
         if (g_tcp_server != nullptr)
         {
             g_tcp_server->clear_policy_tcp_targets_nrt();
+            g_tcp_server->policy_running.store(false);
+            g_tcp_server->policy_motion_settling.store(false);
+            A10PolicyTrace trace;
+            trace.event = "stop";
+            g_tcp_server->record_policy_trace(trace);
         }
         mout() << "policy: 收到 stop 请求，退出 policy 驱动" << std::endl;
         return 0;
@@ -624,6 +597,13 @@ auto A10PolicyTcpDriver::executeRT() -> int
         {
             imp_->max_grip_delta_ = doubleParam("max_grip_delta");
         }
+        if (g_tcp_server != nullptr)
+        {
+            g_tcp_server->policy_running.store(true);
+            append_policy_rtc_trace("start", g_tcp_server->policy_batch_commit_seq(),
+                g_tcp_server->policy_batch_queue_size(), 0, 0.0, 0, {}, {}, read_follower_seven(*this),
+                imp_->max_arm_vel_rad_s, imp_->max_gripper_vel, imp_->max_axis_delta_rad_, imp_->max_grip_delta_);
+        }
     }
 
     if (g_tcp_server == nullptr)
@@ -635,7 +615,72 @@ auto A10PolicyTcpDriver::executeRT() -> int
         return 0;
     }
 
+    const auto cycle_start = anchor_monotonic_time_ns();
+    if (imp_->previous_cycle_ns_ != 0)
+        imp_->max_control_period_us_ = std::max(imp_->max_control_period_us_, (cycle_start - imp_->previous_cycle_ns_) / 1000.0);
+    imp_->previous_cycle_ns_ = cycle_start;
     imp_->run_one_cycle(*this);
+    if (!imp_->reference_command_.empty())
+    {
+        const auto& command = imp_->smoothing_
+            ? imp_->smoother_.step(imp_->reference_command_, imp_->max_arm_vel_rad_s, imp_->max_arm_acc_)
+            : imp_->reference_command_;
+        apply_seven_to_motors(*this, command);
+        g_tcp_server->policy_motion_settling.store(imp_->smoothing_ && !imp_->smoother_.settled(imp_->reference_command_));
+        if (!imp_->previous_command_.empty())
+        {
+            for (std::size_t axis = 0; axis < 6; ++axis)
+            {
+                const double velocity = (command[axis] - imp_->previous_command_[axis]) / k_dt;
+                imp_->max_command_vel_ = std::max(imp_->max_command_vel_, std::abs(velocity));
+                imp_->max_command_acc_ = std::max(imp_->max_command_acc_,
+                    std::abs(velocity - imp_->previous_velocity_[axis]) / k_dt);
+                imp_->previous_velocity_[axis] = velocity;
+            }
+        }
+        imp_->previous_command_ = command;
+    }
+    if (count() % 25 == 0)
+    {
+        const auto sequence = g_tcp_server->policy_batch_commit_seq();
+        std::vector<double> command(7, 0.0);
+        auto& motors = controller()->motorPool();
+        for (std::size_t axis = 0; axis < 6 && axis < motors.size(); ++axis)
+            command[axis] = motors[axis].targetPos();
+        command[6] = g_vr_grip_target_mm.load(std::memory_order_acquire);
+        g_tcp_server->update_policy_remaining_time(sequence, command, imp_->max_arm_vel_rad_s, imp_->max_gripper_vel);
+    }
+    imp_->max_control_work_us_ = std::max(imp_->max_control_work_us_, (anchor_monotonic_time_ns() - cycle_start) / 1000.0);
+    if (count() % 50 == 0)
+    {
+        A10PolicyTrace trace;
+        trace.event = "sample";
+        trace.sequence = g_tcp_server->policy_batch_commit_seq();
+        trace.remaining = g_tcp_server->policy_batch_queue_size();
+        trace.arm_vel = imp_->max_arm_vel_rad_s;
+        trace.grip_vel = imp_->max_gripper_vel;
+        trace.max_axis_delta = imp_->max_axis_delta_rad_;
+        trace.max_grip_delta = imp_->max_grip_delta_;
+        trace.max_control_period_us = imp_->max_control_period_us_;
+        trace.max_control_work_us = imp_->max_control_work_us_;
+        trace.smoothing = imp_->smoothing_;
+        trace.arm_acc = imp_->max_arm_acc_;
+        trace.reference_lag_rad = imp_->smoothing_ && !imp_->reference_command_.empty()
+            ? imp_->smoother_.lag(imp_->reference_command_) : 0.0;
+        trace.max_command_vel_rad_s = imp_->max_command_vel_;
+        trace.max_command_acc_rad_s2 = imp_->max_command_acc_;
+        const auto actual = read_follower_seven(*this);
+        std::copy_n(actual.begin(), 7, trace.actual.begin());
+        auto& motors = controller()->motorPool();
+        for (std::size_t axis = 0; axis < 6 && axis < motors.size(); ++axis)
+            trace.q0[axis] = motors[axis].targetPos();
+        trace.q0[6] = g_vr_grip_target_mm.load(std::memory_order_acquire);
+        g_tcp_server->record_policy_trace(trace);
+        imp_->max_control_period_us_ = 0.0;
+        imp_->max_control_work_us_ = 0.0;
+        imp_->max_command_vel_ = 0.0;
+        imp_->max_command_acc_ = 0.0;
+    }
     return count();
 }
 
@@ -646,6 +691,7 @@ A10PolicyTcpDriver::A10PolicyTcpDriver(const std::string& name) : imp_(new Imp)
         "<Command name=\"policy\">"
         "  <GroupParam name=\"group_param\">"
         "    <Param name=\"arm_vel\" abbreviation=\"a\" default=\"0.05\"/>"
+        "    <Param name=\"arm_acc\" default=\"0.5\"/>"
         "    <Param name=\"grip_vel\" abbreviation=\"g\" default=\"80\"/>"
         "    <Param name=\"max_axis_delta\" abbreviation=\"x\" default=\"0.5\"/>"
         "    <Param name=\"max_grip_delta\" abbreviation=\"h\" default=\"85\"/>"
@@ -654,6 +700,14 @@ A10PolicyTcpDriver::A10PolicyTcpDriver(const std::string& name) : imp_(new Imp)
 }
 
 A10PolicyTcpDriver::~A10PolicyTcpDriver() = default;
+auto A10PolicyTcpDriver::collectNrt() -> void
+{
+    if (g_tcp_server != nullptr)
+    {
+        g_tcp_server->policy_running.store(false);
+        g_tcp_server->policy_motion_settling.store(false);
+    }
+}
 KAANH_DEFINE_BIG_FOUR_CPP(A10PolicyTcpDriver)
 
 auto A10PolicyTcpCliStop::prepareNrt() -> void

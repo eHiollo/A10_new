@@ -1,5 +1,22 @@
 # client（VLA / OpenPI 桥接）
 
+精细操作第二阶段：平滑 async 的新批次首段额外采用观测年龄作为最低衔接跨度（通常约 0.3 秒），减轻快速追逐旧目标造成的回拉；同批后续动作保持原步长下限。手臂/夹爪限速不变，sync/pipeline 不变。开闭夹爪可能更慢，需要检查释放时机和成功率；停止机器人后重启控制器生效，bridge 可继续常驻。
+
+精细动作时序修复：默认平滑 async 不再按最快 4ms 消费一个小动作，而是至少保留名义 1/30 秒插值跨度（500Hz 量化后每段占用 36ms）。手臂/夹爪共用段时间，原速度限制仍有效；长距离允许更慢。此改动需重启控制器，bridge 启动命令不变，实际往返改善需下一次实机验证。
+
+async 默认启用加速度受限衔接（需要重启新编译的 `build/kaanh_rtc/bin/kaanhbin`）。控制器仍输入 `policy`，默认手臂限速 0.05rad/s 不变，新增 `arm_acc=0.5rad/s²`；bridge 加 `--no-async-smoothing` 可作原插值对照，sync/pipeline 保持原行为。平滑会增加响应滞后，实机效果仍需验证；切换前先停机。日志新增指令速度、加速度和参考滞后，可用下一轮任务检查。
+
+```bash
+cd /home/kaanh/A10_new/client
+python run_bridge.py --policy-host 192.168.110.119 --policy-port 8000 \
+  --robot-host 127.0.0.1 --robot-port 8080 \
+  --mode async --hz 10 --top-camera 2 --right-camera 0
+```
+
+2026-10-08：bridge 支持常驻，`policy` / `stop` 可独立启停机械臂；相机年龄仅记日志。新日志自动写入 `client/logs/run_*/`，用 `python client/analyze_policy_log.py` 汇总。实机证据、日志字段和待确认项见 [异步推理实机记录](../doc/async_policy_field_notes.md)。`--hz` 仅用于 sync，不影响异步发送频率或模型动作步数。
+
+同步运行“一段一停”时，可测试 `--mode pipeline`：尾段提前推理，旧 batch 执行完再衔接。需重启本轮新编译的控制器以提供 `remaining_time_s`；初始提前量为 `--prefetch-lead 0.45`，随后按推理耗时调整。参数传给 `python run_bridge.py`，控制器命令仍为 `policy`。
+
 把 OpenPI 推理服务（websocket）与本仓库 `a10_tcp_server.cpp` 的机器人 TCP 服务桥接起来。  
 原独立目录：`/home/kaanh/Desktop/kannhbin_client`，已并入本仓库 `client/`。
 
@@ -52,7 +69,7 @@ python3 run_bridge.py \
   --start-delay 1.0
 ```
 
-默认相机映射：**顶视 `video0`（`--top-camera` 默认 `0`）**，**右腕 `video2`（`--right-camera` 默认 `2`）**。  
+公司实机已确认默认相机映射：**顶视 `video2`（`--top-camera` 默认 `2`）**，**右腕 `video0`（`--right-camera` 默认 `0`）**。此前反向映射会让相同模型表现明显变化。
 右腕默认旋转 180°（`--right-rotate-180`，可用 `--no-right-rotate-180` 关闭）；顶视默认不旋转（可用 `--top-rotate-180` 开启）。
 
 若没有顶视相机，传 `--top-camera=""`，不要用右腕画面冒充俯视。默认任务提示是 `pick and place`。  
@@ -70,7 +87,7 @@ python3 capture_cameras.py --sources /dev/video0 /dev/video2
 ```
 
 输出例如：`camera_snaps/video0.jpg`、`camera_snaps/video2.jpg`。  
-抓图默认仅对端口 `0` 做 180° 旋转（与顶视倒装一致）。关闭：`--rotate-180-sources`（后不接端口）。
+抓图默认仅对端口 `0` 做 180° 旋转（公司实机右腕相机倒装）。关闭：`--rotate-180-sources`（后不接端口）。
 
 ## 说明
 

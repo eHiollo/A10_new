@@ -26,6 +26,7 @@ class OpenPIWebsocketClient:
         port: int,
         api_key: str | None = None,
         reconnect_interval_s: float = 2.0,
+        infer_timeout_s: float = 60.0,
     ) -> None:
         self._host = host
         self._port = port
@@ -33,9 +34,11 @@ class OpenPIWebsocketClient:
         self._healthz_url = f"http://{host}:{port}/healthz"
         self._api_key = api_key
         self._reconnect_interval_s = reconnect_interval_s
+        self._infer_timeout_s = infer_timeout_s
         self._conn: websockets.sync.client.ClientConnection | None = None
         self._packer = Packer()
         self._server_metadata: dict[str, Any] = {}
+        self.last_transport_timing: dict[str, float] = {}
         self._connect()
 
     @property
@@ -53,7 +56,7 @@ class OpenPIWebsocketClient:
         if status != 200 or body != "OK":
             raise RuntimeError(f"healthz {self._healthz_url} -> {status} {body!r}")
 
-    def _connect(self) -> None:
+    def _connect(self, retry: bool = True) -> None:
         while True:
             try:
                 self._check_healthz()
@@ -65,7 +68,7 @@ class OpenPIWebsocketClient:
                     max_size=None,
                     additional_headers=headers,
                 )
-                metadata_msg = self._conn.recv()
+                metadata_msg = self._conn.recv(timeout=10.0)
                 if isinstance(metadata_msg, str):
                     raise RuntimeError(f"Expected metadata as bytes, got text: {metadata_msg}")
                 metadata = unpackb(metadata_msg)
@@ -75,25 +78,36 @@ class OpenPIWebsocketClient:
                 logger.info("Connected to OpenPI websocket server: %s metadata=%s", self._uri, metadata)
                 return
             except Exception as exc:  # noqa: BLE001
+                self.close()
+                if not retry:
+                    raise
                 logger.warning("OpenPI websocket connect failed (%s), retrying...", exc)
                 time.sleep(self._reconnect_interval_s)
 
     def infer(self, observation: dict[str, Any]) -> dict[str, Any]:
         if self._conn is None:
-            self._connect()
+            self._connect(retry=False)
 
         assert self._conn is not None
         try:
+            started = time.monotonic()
             payload = self._packer.pack(observation)
+            packed = time.monotonic()
             self._conn.send(payload)
-            response = self._conn.recv()
+            sent = time.monotonic()
+            response = self._conn.recv(timeout=self._infer_timeout_s)
+            received = time.monotonic()
             if isinstance(response, str):
                 raise RuntimeError(f"Inference server returned error text: {response}")
-            return unpackb(response)
+            result = unpackb(response)
+            self.last_transport_timing = {"pack_ms": (packed - started) * 1000.0,
+                                          "send_ms": (sent - packed) * 1000.0,
+                                          "receive_wait_ms": (received - sent) * 1000.0,
+                                          "unpack_ms": (time.monotonic() - received) * 1000.0}
+            return result
         except Exception:  # noqa: BLE001
-            logger.exception("OpenPI websocket inference failed; reconnecting.")
+            logger.exception("OpenPI websocket inference failed.")
             self.close()
-            self._connect()
             raise
 
     def close(self) -> None:

@@ -166,6 +166,7 @@ bool A10TcpServer::send_set_joints(const std::vector<double> &q)
     {
         std::lock_guard<std::mutex> lk(robot_q_mutex_);
         robot_q_ = q;
+        robot_q_updated_at_ = std::chrono::steady_clock::now();
     }
 
     // 不需要主动广播
@@ -224,84 +225,45 @@ std::vector<double> A10TcpServer::get_target_q()
     // std::cout << "\n";
 }
 
-bool A10TcpServer::peek_policy_batch_front(std::vector<double>& out)
+bool A10TcpServer::peek_policy_batch_front(std::vector<double>& out, std::uint64_t expected_seq)
 {
-    std::lock_guard<std::mutex> lk(batch_mutex_);
-    if (target_q_batch_.empty())
-    {
-        return false;
-    }
-    out = target_q_batch_.front();
-    return true;
+    return policy_batch_.peek(out, expected_seq);
 }
 
-void A10TcpServer::pop_policy_batch_front()
+bool A10TcpServer::pop_policy_batch_front(std::uint64_t expected_seq)
 {
-    std::lock_guard<std::mutex> lk(batch_mutex_);
-    if (!target_q_batch_.empty())
-    {
-        target_q_batch_.pop_front();
-    }
+    return policy_batch_.pop(expected_seq);
 }
 
 bool A10TcpServer::policy_batch_queue_empty()
 {
-    std::lock_guard<std::mutex> lk(batch_mutex_);
-    return target_q_batch_.empty();
+    return policy_batch_.status().remaining == 0;
 }
 
 std::size_t A10TcpServer::policy_batch_queue_size()
 {
-    std::lock_guard<std::mutex> lk(batch_mutex_);
-    return target_q_batch_.size();
+    return policy_batch_.status().remaining;
 }
 
 std::uint64_t A10TcpServer::policy_batch_commit_seq()
 {
-    std::lock_guard<std::mutex> lk(batch_mutex_);
-    return batch_commit_seq_;
+    return policy_batch_.status().sequence;
+}
+
+void A10TcpServer::update_policy_remaining_time(std::uint64_t sequence, const std::vector<double>& command,
+                                               double arm_vel, double grip_vel)
+{
+    policy_batch_.update_remaining_time(sequence, command, arm_vel, grip_vel);
 }
 
 int A10TcpServer::drop_policy_batch_prefix(std::uint64_t expected_seq, double action_step_s, double* age_s_out)
 {
-    std::lock_guard<std::mutex> lk(batch_mutex_);
-    if (expected_seq != batch_commit_seq_)
-    {
-        return -1;
-    }
-    const double age = (std::isfinite(batch_obs_age_s_) && batch_obs_age_s_ > 0.0) ? batch_obs_age_s_ : 0.0;
-    if (age_s_out != nullptr)
-    {
-        *age_s_out = age;
-    }
-    if (target_q_batch_.empty() || !(action_step_s > 0.0) || age <= 0.0)
-    {
-        return 0;
-    }
-    int skip = static_cast<int>(std::floor((age + 1e-9) / action_step_s));
-    const int max_skip = static_cast<int>(target_q_batch_.size()) - 1;
-    if (skip > max_skip)
-    {
-        skip = max_skip;
-    }
-    if (skip < 0)
-    {
-        skip = 0;
-    }
-    for (int i = 0; i < skip; ++i)
-    {
-        target_q_batch_.pop_front();
-    }
-    return skip;
+    return policy_batch_.align(expected_seq, action_step_s, age_s_out);
 }
 
 void A10TcpServer::clear_policy_tcp_targets_nrt()
 {
-    {
-        std::lock_guard<std::mutex> lk(batch_mutex_);
-        target_q_batch_.clear();
-        ++batch_commit_seq_;
-    }
+    policy_batch_.clear();
     {
         std::lock_guard<std::mutex> lk(q_mutex_);
         target_q_.clear();
@@ -372,16 +334,53 @@ bool A10TcpServer::fetch_ee_anchor_if_updated(
 
 void A10TcpServer::send_policy_status(int client_sock)
 {
-    size_t rem = 0;
-    std::uint64_t seq = 0;
+    const auto status = policy_batch_.status();
+    nlohmann::json result = {
+        {"policy_protocol_version", 2}, {"controller_build", __DATE__ " " __TIME__},
+        {"idle", status.remaining == 0 && !policy_motion_settling.load()}, {"remaining", status.remaining},
+        {"motion_settling", policy_motion_settling.load()}, {"supports_async_smoothing", true},
+        {"batch_smoothing", status.smooth},
+        {"minimum_action_segment_s", a10_tcp::policy_min_segment_steps(status.smooth) * 0.002},
+        {"latency_aware_handoff", true},
+        {"remaining_time_s", status.remaining_time_s},
+        {"batch_seq", status.sequence}, {"received", status.received},
+        {"prefix_skip", status.prefix_skip}, {"alignment_age_s", status.alignment_age_s},
+        {"aligned", status.aligned}, {"expired", status.expired},
+        {"policy_running", policy_running.load()}, {"action_step_s", 1.0 / 30.0},
+        {"motor_checks_disabled", true},
+        {"trace_dropped", policy_trace_dropped_.load()}};
     {
-        std::lock_guard<std::mutex> lk(batch_mutex_);
-        rem = target_q_batch_.size();
-        seq = batch_commit_seq_;
+        std::lock_guard<std::mutex> lock(robot_q_mutex_);
+        result["robot_q"] = robot_q_;
+        if (robot_q_updated_at_ != std::chrono::steady_clock::time_point{})
+            result["state_age_s"] = std::chrono::duration<double>(std::chrono::steady_clock::now() - robot_q_updated_at_).count();
     }
-    const char* idle_str = (rem == 0) ? "true" : "false";
-    std::string payload = std::string("{\"idle\":") + idle_str + ",\"remaining\":" + std::to_string(rem)
-        + ",\"batch_seq\":" + std::to_string(seq) + "}\n";
+    std::array<A10PolicyTrace, 256> traces;
+    std::size_t trace_count;
+    {
+        std::lock_guard<std::mutex> lock(policy_trace_mutex_);
+        trace_count = policy_trace_count_;
+        std::copy_n(policy_traces_.begin(), trace_count, traces.begin());
+        policy_trace_count_ = 0;
+    }
+    result["events"] = nlohmann::json::array();
+    for (std::size_t index = 0; index < trace_count; ++index)
+    {
+        const auto& trace = traces[index];
+        result["events"].push_back({
+            {"event", trace.event}, {"batch_seq", trace.sequence}, {"monotonic_ns", trace.monotonic_ns},
+            {"remaining", trace.remaining}, {"n_steps", trace.n_steps},
+            {"age_s", trace.age_s}, {"prefix_skip", trace.prefix_skip},
+            {"arm_vel", trace.arm_vel}, {"grip_vel", trace.grip_vel},
+            {"max_axis_delta", trace.max_axis_delta}, {"max_grip_delta", trace.max_grip_delta},
+            {"max_control_period_us", trace.max_control_period_us}, {"max_control_work_us", trace.max_control_work_us},
+            {"smoothing", trace.smoothing}, {"arm_acc", trace.arm_acc},
+            {"reference_lag_rad", trace.reference_lag_rad},
+            {"max_command_vel_rad_s", trace.max_command_vel_rad_s},
+            {"max_command_acc_rad_s2", trace.max_command_acc_rad_s2},
+            {"q0", trace.q0}, {"q1", trace.q1}, {"actual", trace.actual}});
+    }
+    const std::string payload = result.dump() + "\n";
 
     ssize_t total = 0;
     const char* buf = payload.c_str();
@@ -394,6 +393,18 @@ void A10TcpServer::send_policy_status(int client_sock)
         total += n;
         left -= n;
     }
+}
+
+void A10TcpServer::record_policy_trace(A10PolicyTrace trace)
+{
+    trace.monotonic_ns = a10_tcp::anchor_monotonic_time_ns();
+    std::unique_lock<std::mutex> lock(policy_trace_mutex_, std::try_to_lock);
+    if (!lock.owns_lock() || policy_trace_count_ == policy_traces_.size())
+    {
+        ++policy_trace_dropped_;
+        return;
+    }
+    policy_traces_[policy_trace_count_++] = trace;
 }
 
 static void send_line_to_client(int client_sock, const std::string& line)
@@ -449,9 +460,12 @@ void A10TcpServer::send_leader_state(int client_sock)
 void A10TcpServer::send_follower_state(int client_sock)
 {
     std::vector<double> current_q;
+    double state_age_s = -1.0;
     {
         std::lock_guard<std::mutex> lk(robot_q_mutex_);
         current_q = robot_q_;
+        if (robot_q_updated_at_ != std::chrono::steady_clock::time_point{})
+            state_age_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - robot_q_updated_at_).count();
     }
     
     if (current_q.size() < 13)
@@ -473,7 +487,8 @@ void A10TcpServer::send_follower_state(int client_sock)
     //将第12维度的舵机数据传出去
     payload += ", ";
     payload += std::to_string(current_q[12]);
-    payload += "]}\n";
+    payload += "],\"state_valid\":" + std::string(state_age_s >= 0.0 ? "true" : "false")
+        + ",\"state_age_s\":" + std::to_string(state_age_s) + "}\n";
     
     // Send directly to the requesting client
     ssize_t total = 0;
@@ -616,64 +631,41 @@ void A10TcpServer::process_line(
                 return;
             }
             std::deque<std::vector<double>> new_batch;
-            const std::size_t actions_array_len = j["actions"].size();
-            std::size_t row_index = 0;
             for (const auto& row : j["actions"])
             {
-                if (!row.is_array())
-                {
-                    std::cout << "SET_JOINTS_BATCH: skip actions[" << row_index << "] (not JSON array)\n";
-                    ++row_index;
-                    continue;
-                }
+                if (!row.is_array() || row.size() != 7)
+                    throw std::invalid_argument("each action must have exactly seven numbers");
                 std::vector<double> v;
                 for (const auto& x : row)
                 {
-                    if (x.is_number())
-                    {
-                        v.push_back(x.get<double>());
-                    }
-                }
-                if (v.empty())
-                {
-                    std::cout << "SET_JOINTS_BATCH: skip actions[" << row_index << "] (no numeric elements)\n";
-                    ++row_index;
-                    continue;
-                }
-                while (v.size() < 7)
-                {
-                    v.push_back(0.0);
-                }
-                if (v.size() > 7)
-                {
-                    v.resize(7);
+                    if (!x.is_number())
+                        throw std::invalid_argument("action contains a non-number");
+                    v.push_back(x.get<double>());
                 }
                 new_batch.push_back(std::move(v));
-                ++row_index;
             }
             const size_t n = new_batch.size();
-            if (actions_array_len != n)
-            {
-                std::cout << "SET_JOINTS_BATCH: warning JSON actions length " << actions_array_len
-                          << " != parsed keyframes " << n << " (skipped rows → 队首可能不是模型 actions[0])\n";
-            }
             double obs_age_s = 0.0;
-            if (j.contains("obs_age_s") && j["obs_age_s"].is_number())
+            if (j.contains("obs_age_s"))
             {
+                if (!j["obs_age_s"].is_number())
+                    throw std::invalid_argument("invalid obs_age_s");
                 obs_age_s = j["obs_age_s"].get<double>();
-                if (!std::isfinite(obs_age_s) || obs_age_s < 0.0 || obs_age_s > 5.0)
-                {
-                    obs_age_s = 0.0;
-                }
             }
+            std::optional<std::uint64_t> expected_sequence;
+            if (j.contains("expected_batch_seq"))
             {
-                std::lock_guard<std::mutex> lk(batch_mutex_);
-                target_q_batch_ = std::move(new_batch);
-                batch_obs_age_s_ = obs_age_s;
-                ++batch_commit_seq_;
+                if (!j["expected_batch_seq"].is_number_unsigned())
+                    throw std::invalid_argument("invalid expected_batch_seq");
+                expected_sequence = j["expected_batch_seq"].get<std::uint64_t>();
             }
+            if (j.contains("smooth") && !j["smooth"].is_boolean())
+                throw std::invalid_argument("smooth must be boolean");
+            const bool smooth = j.value("smooth", false);
+            const auto batch_seq = policy_batch_.replace(std::move(new_batch), obs_age_s,
+                a10_tcp::PolicyBatchQueue::Clock::now(), expected_sequence, smooth);
             send_line_to_client(client_sock,
-                std::string("{\"accepted\":true,\"queued\":") + std::to_string(n) + "}\n");
+                nlohmann::json({{"accepted", true}, {"queued", n}, {"batch_seq", batch_seq}, {"smooth", smooth}}).dump() + "\n");
         }
         catch (const std::exception& e)
         {

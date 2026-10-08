@@ -60,6 +60,7 @@ class CameraConfig:
     rotate_180: bool = False
     """每帧独占打开/读取/释放，避免多相机同时占用 USB 导致读帧失败。"""
     exclusive_per_read: bool = False
+    max_frame_age_s: float = 0.5
 
 
 class USBCamera:
@@ -68,6 +69,7 @@ class USBCamera:
     def __init__(self, cfg: CameraConfig) -> None:
         self._cfg = cfg
         self._cap: cv2.VideoCapture | None = None
+        self.last_frame_info: dict = {}
         if not self._cfg.exclusive_per_read:
             self._open_persistent()
 
@@ -120,8 +122,12 @@ class USBCamera:
 
     def read_rgb(self) -> np.ndarray:
         if self._cfg.exclusive_per_read:
-            return self._read_exclusive()
-        return self._read_persistent()
+            frame = self._read_exclusive()
+        else:
+            frame = self._read_persistent()
+        self.last_frame_info = {"source": self._cfg.source, "rotate_180": self._cfg.rotate_180,
+                                "age_s": 0.0, "read_monotonic_s": time.monotonic(), "shape": list(frame.shape)}
+        return frame
 
     @staticmethod
     def as_policy_hwc(frame_rgb: np.ndarray) -> np.ndarray:
@@ -180,6 +186,8 @@ class ThreadedCamera:
         self._stop = threading.Event()
         self._frame_lock = threading.Lock()
         self._latest: np.ndarray | None = None
+        self._latest_at = 0.0
+        self.last_frame_info: dict = {}
         self._open_error: Exception | None = None
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
@@ -209,6 +217,7 @@ class ThreadedCamera:
                 frame_rgb = _bgr_to_rgb(frame_bgr, self._cfg.rotate_180)
                 with self._frame_lock:
                     self._latest = frame_rgb
+                    self._latest_at = time.monotonic()
             except Exception as exc:  # noqa: BLE001
                 self._open_error = exc
                 if cap is not None:
@@ -228,7 +237,12 @@ class ThreadedCamera:
             with self._frame_lock:
                 frame = self._latest
                 err = self._open_error
+                frame_at = self._latest_at
             if frame is not None:
+                age = time.monotonic() - frame_at
+                self.last_frame_info = {"source": self._cfg.source, "rotate_180": self._cfg.rotate_180,
+                                        "age_s": age, "stale": age > self._cfg.max_frame_age_s,
+                                        "read_monotonic_s": frame_at, "shape": list(frame.shape)}
                 return frame
             if err is not None and time.time() - t0 > 2.0:
                 raise RuntimeError(f"ThreadedCamera source={self._cfg.source} failed: {err}")
