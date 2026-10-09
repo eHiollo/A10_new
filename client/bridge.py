@@ -13,6 +13,7 @@ import numpy as np
 
 from openpi_ws_client import OpenPIWebsocketClient
 from robot_tcp_client import RobotTcpClient
+from temporal_ensemble import TemporalEnsemble
 from usb_camera import CameraConfig, ThreadedCamera, USBCamera
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,9 @@ class BridgeConfig:
     infer_backoff_s: float = 0.005
     prefetch_lead_s: float = 0.45
     async_smoothing: bool = True
+    temporal_ensemble: bool = True
+    ensemble_decay: float = 0.01
+    ensemble_gripper: bool = True
 
 
 class PiRobotBridge:
@@ -322,6 +326,8 @@ class PiRobotBridge:
         buffer_lock = self._async_buffer_lock
         buffer_not_empty = self._async_buffer_not_empty
         infer_cycle = 0
+        ensemble = TemporalEnsemble(self._cfg.ensemble_decay, self._cfg.ensemble_gripper)
+        ensemble_sequence = None
 
         if self._cfg.start_delay_s > 0:
             logger.info("async 启动延时 %.3fs。", self._cfg.start_delay_s)
@@ -376,9 +382,19 @@ class PiRobotBridge:
 
                 status = self._robot.get_policy_status()
                 if status.get("policy_running") is False:
+                    ensemble.clear()
+                    ensemble_sequence = None
                     if self._log is not None:
                         self._log.write("idle_prediction", chunk_len=n, obs_age_s=time.perf_counter() - t_obs)
                     continue
+                if self._cfg.temporal_ensemble:
+                    if status.get("batch_seq") != ensemble_sequence:
+                        ensemble.clear()
+                    raw_actions = action_chunk
+                    action_chunk, diagnostics = ensemble.fuse(raw_actions, t_obs, float(status.get("action_step_s", 1.0 / 30.0)))
+                    if self._log is not None:
+                        self._log.write("temporal_ensemble", observed_at=t_obs, raw_actions=raw_actions,
+                                        actions=action_chunk, **diagnostics)
                 rem_before = int(status.get("remaining") or 0)
                 obs_age_s = time.perf_counter() - t_obs
                 smooth = self._cfg.async_smoothing and status.get("supports_async_smoothing") is True
@@ -386,6 +402,7 @@ class PiRobotBridge:
                     logger.warning("控制器不支持异步平滑，暂按原逻辑执行；停止机器人并重启新编译的控制器后生效。")
                     self._smoothing_warned = True
                 queued = self._robot.send_policy_actions_batch(action_chunk, obs_age_s=obs_age_s, smooth=smooth)
+                ensemble_sequence = self._robot.last_batch_ack.get("batch_seq")
                 if self._log is not None:
                     self._log.write("async_send", cycle=infer_cycle, remaining_before=rem_before,
                                     queued=queued, obs_age_s=obs_age_s, smooth=smooth, ack=self._robot.last_batch_ack)
@@ -410,13 +427,23 @@ class PiRobotBridge:
                 infer_cycle += 1
             except Exception as exc:
                 logger.exception("async pusher step failed.")
+                ensemble.clear()
+                ensemble_sequence = None
                 if self._log is not None:
                     self._log.write("transport_error", error=repr(exc))
                 self._stop.wait(0.5)
 
 
+class BridgeArgumentParser(argparse.ArgumentParser):
+    def parse_args(self, args=None, namespace=None):
+        parsed = super().parse_args(args, namespace)
+        if parsed.temporal_ensemble is None:
+            parsed.temporal_ensemble = parsed.mode == "async"
+        return parsed
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Bridge OpenPI websocket inference with this repo's a10_tcp_server (TCP).")
+    parser = BridgeArgumentParser(description="Bridge OpenPI websocket inference with this repo's a10_tcp_server (TCP).")
     parser.add_argument("--log-dir", default=str(Path(__file__).resolve().parent / "logs"), help="每次运行创建独立日志目录。")
     parser.add_argument("--camera-max-age", type=float, default=0.5, help="仅日志标记：相机缓存帧过旧阈值（秒），不阻止 bridge 运行。")
     parser.add_argument("--infer-timeout", type=float, default=60.0, help="推理回包超时（秒），需包含首次预热。")
@@ -485,6 +512,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="async=执行中不断替换；sync=走完再推理；pipeline=尾段提前推理、走完再衔接。",
     )
     parser.add_argument("--prefetch-lead", type=float, default=0.45, help="pipeline 提前推理的初始秒数，会按实测推理耗时调整。")
+    parser.add_argument("--temporal-ensemble", action=argparse.BooleanOptionalAction, default=None,
+                        help="async 默认开启 ACT 式指数融合；--no-temporal-ensemble 关闭。sync/pipeline 默认关闭。")
+    parser.add_argument("--ensemble-decay", type=float, default=0.01, help="指数权重衰减，旧预测在前；0 为平均。")
+    parser.add_argument("--ensemble-gripper", action=argparse.BooleanOptionalAction, default=True,
+                        help="是否融合夹爪；--no-ensemble-gripper 仅融合手臂。")
     parser.add_argument("--async-smoothing", action=argparse.BooleanOptionalAction, default=True,
                         help="async 使用控制器加速度受限衔接；--no-async-smoothing 恢复原插值供对照。")
     parser.add_argument(
@@ -525,6 +557,10 @@ def run_from_args(args: argparse.Namespace, runtime_log=None) -> None:
         raise ValueError("--infer-timeout must be positive and finite")
     if not np.isfinite(args.prefetch_lead) or args.prefetch_lead <= 0:
         raise ValueError("--prefetch-lead must be positive and finite")
+    if not np.isfinite(args.ensemble_decay) or args.ensemble_decay < 0:
+        raise ValueError("--ensemble-decay must be finite and nonnegative")
+    if args.temporal_ensemble and args.mode != "async":
+        raise ValueError("--temporal-ensemble only supports --mode async")
     ws_client = OpenPIWebsocketClient(
         host=args.policy_host,
         port=args.policy_port,
@@ -575,6 +611,9 @@ def run_from_args(args: argparse.Namespace, runtime_log=None) -> None:
             mode=str(args.mode),
             buffer_target=max(1, int(args.buffer_target)),
             async_smoothing=bool(args.async_smoothing),
+            temporal_ensemble=bool(args.temporal_ensemble),
+            ensemble_decay=float(args.ensemble_decay),
+            ensemble_gripper=bool(args.ensemble_gripper),
             prefetch_lead_s=args.prefetch_lead,
         ),
         runtime_log=runtime_log,

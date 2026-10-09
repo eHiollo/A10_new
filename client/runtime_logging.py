@@ -51,7 +51,7 @@ class RuntimeLog:
             status = subprocess.check_output(["git", "status", "--short"], cwd=repo, text=True)
         except (OSError, subprocess.CalledProcessError):
             revision, status = "unknown", "unknown"
-        sources = [*Path(__file__).parent.glob("*.py"), repo / "a10_policy_tcp_plan.cpp", repo / "a10_tcp_server.cpp", repo / "a10_policy_batch.hpp", repo / "a10_policy_smoother.hpp"]
+        sources = [*Path(__file__).parent.glob("*.py"), repo / "a10_policy_tcp_plan.cpp", repo / "a10_tcp_server.cpp", repo / "a10_policy_batch.hpp", repo / "a10_policy_smoother.hpp", repo / "a10_policy_trajectory.hpp", repo / "a10_policy_jerk_trajectory.hpp", repo / "a10_vr_joint_guard.hpp"]
         hashes = {str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources if path.exists()}
         self.write("session_start", config=safe_config, revision=revision, git_status=status, source_sha256=hashes)
         logging.getLogger(__name__).info("本次实机日志：%s", self.path)

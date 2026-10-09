@@ -1645,9 +1645,12 @@
             <A10PolicyTcpDriver name="plan">
                 <Command __prop_name__="command" name="policy">
                     <GroupParam name="group_param">
-                        <Param name="arm_vel" abbreviation="a" default="0.05"/>
-                        <Param name="arm_acc" default="0.5"/>
-                        <Param name="grip_vel" abbreviation="g" default="80"/>
+                        <Param name="arm_vel" abbreviation="a" default="0.3"/>
+                        <Param name="arm_acc" default="1.5"/>
+                        <Param name="future_handoff" default="1"/>
+                        <Param name="jerk_smooth" default="0"/>
+                        <Param name="arm_jerk" default="20.0"/>
+                        <Param name="grip_vel" abbreviation="g" default="50"/>
                         <Param name="max_axis_delta" abbreviation="x" default="0.5"/>
                         <Param name="max_grip_delta" abbreviation="h" default="85"/>
                     </GroupParam>

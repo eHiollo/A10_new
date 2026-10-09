@@ -4,11 +4,9 @@
 #include <cassert>
 #include <iostream>
 
-int main()
+void test_smoother(double max_velocity, double max_acceleration = 0.5)
 {
     constexpr double dt = 0.002;
-    constexpr double max_velocity = 0.05;
-    constexpr double max_acceleration = 0.5;
     a10_tcp::PolicyCommandSmoother smoother;
     std::vector<double> reference(7, 0.0);
     std::vector<double> previous(7, 0.0);
@@ -37,6 +35,7 @@ int main()
             const double acceleration = (velocity - previous_velocity[axis]) / dt;
             assert(std::isfinite(command[axis]));
             assert(std::abs(velocity) <= max_velocity + 1e-10);
+            assert(std::abs(velocity) <= a10_tcp::VrJointGuard::speed_limit(axis) + 1e-10);
             assert(std::abs(acceleration) <= max_acceleration + 1e-8);
             measured_velocity = std::max(measured_velocity, std::abs(velocity));
             measured_acceleration = std::max(measured_acceleration, std::abs(acceleration));
@@ -97,4 +96,61 @@ int main()
     assert(a10_tcp::policy_blend_steps(std::vector<double>(7, 0.0), std::vector<double>(7, 1.0), max_velocity, 80.0) > minimum_steps);
     std::cout << "smoother tests passed: max_velocity=" << measured_velocity
               << " max_acceleration=" << measured_acceleration << " max_lag=" << max_lag << '\n';
+}
+
+void test_guarded_smoother(double working_acceleration)
+{
+    using Guard = a10_tcp::VrJointGuard;
+    Guard guard;
+    a10_tcp::PolicyCommandSmoother smoother;
+    Guard::Joints previous{}, velocity{}, actual{};
+    std::vector<double> command(7, 0.0);
+    smoother.reset(command);
+    for (int tick = 0; tick < 4000; ++tick)
+    {
+        std::vector<double> reference(7, 0.0);
+        for (std::size_t axis = 0; axis < 6; ++axis)
+            reference[axis] = 0.2 * std::sin(tick * 0.003 + axis * 0.1);
+        const auto& proposed = smoother.step(reference, Guard::speed_limit(5), working_acceleration);
+        Guard::Joints requested{};
+        std::copy_n(proposed.begin(), 6, requested.begin());
+        const auto result = guard.step(previous, velocity, requested, actual);
+        assert(!guard.faulted());
+        for (std::size_t axis = 0; axis < 6; ++axis)
+        {
+            assert(std::abs(result.velocity[axis]) <= Guard::speed_limit(axis) + 1e-8);
+            assert(std::abs(result.velocity[axis] - velocity[axis]) <= Guard::acceleration * Guard::dt + 1e-8);
+            assert(std::abs(result.velocity[axis] - velocity[axis]) <= working_acceleration * Guard::dt + 1e-8);
+        }
+        previous = result.position;
+        velocity = result.velocity;
+        actual = previous;
+        std::copy(previous.begin(), previous.end(), command.begin());
+        smoother.accept(command, velocity);
+    }
+    actual[0] += 0.2;
+    auto result = guard.step(previous, velocity, previous, actual);
+    assert(guard.faulted());
+    assert(std::string(result.fault) == "joint_following_error");
+    for (int tick = 0; tick < 120; ++tick)
+    {
+        previous = result.position;
+        velocity = result.velocity;
+        actual = previous;
+        result = guard.step(previous, velocity, previous, actual, true);
+        for (std::size_t axis = 0; axis < 6; ++axis)
+            assert(std::abs(result.velocity[axis]) <= std::abs(velocity[axis]) + 1e-8);
+    }
+    for (double speed : result.velocity)
+        assert(speed == 0.0);
+}
+
+int main()
+{
+    test_guarded_smoother(a10_tcp::VrJointGuard::acceleration);
+    test_guarded_smoother(1.0);
+    test_smoother(0.05);
+    test_smoother(0.075);
+    test_smoother(a10_tcp::VrJointGuard::speed_limit(5), a10_tcp::VrJointGuard::acceleration);
+    test_smoother(a10_tcp::VrJointGuard::speed_limit(5), 1.0);
 }

@@ -29,6 +29,16 @@ struct A10PolicyTrace
     std::size_t remaining{0};
     int n_steps{0};
     int prefix_skip{0};
+    int handoff_skip{0};
+    double handoff_duration_s{0.0};
+    double handoff_target_time_s{0.0};
+    double handoff_late_s{0.0};
+    bool handoff_fallback{false};
+    bool planned_trajectory{false};
+    bool jerk_limited{false};
+    double arm_jerk{0.0};
+    double active_plan_remaining_s{0.0};
+    double target_error_rad{0.0};
     double age_s{0.0};
     double arm_vel{0.0};
     double grip_vel{0.0};
@@ -41,6 +51,10 @@ struct A10PolicyTrace
     double reference_lag_rad{0.0};
     double max_command_vel_rad_s{0.0};
     double max_command_acc_rad_s2{0.0};
+    double max_command_jerk_rad_s3{0.0};
+    std::array<double, 6> command_velocity_rad_s{};
+    std::array<double, 6> command_acceleration_rad_s2{};
+    std::array<double, 6> max_following_error_rad{};
     std::array<double, 7> q0{};
     std::array<double, 7> q1{};
     std::array<double, 7> actual{};
@@ -65,11 +79,22 @@ public:
     std::size_t policy_batch_queue_size();
     std::uint64_t policy_batch_commit_seq();
     a10_tcp::PolicyBatchStatus policy_batch_status() const { return policy_batch_.status(); }
+    void mark_policy_planned(std::uint64_t sequence, bool jerk_limited = false) { policy_batch_.mark_planned(sequence, jerk_limited); }
+    bool reject_policy_batch(std::uint64_t sequence) { return policy_batch_.reject(sequence); }
     void update_policy_remaining_time(std::uint64_t sequence, const std::vector<double>& command,
                                       double arm_vel, double grip_vel);
     /// 同一把锁里按观测年龄加接收后的等待时间丢掉过期帧，整段过期则全部丢弃。
     /// ``expected_seq`` 与当前 batch 不一致时返回 -1，调用方下个周期再对齐。
     int drop_policy_batch_prefix(std::uint64_t expected_seq, double action_step_s, double* age_s_out);
+    bool select_policy_handoff(std::uint64_t sequence, double step_s, const std::vector<double>& command,
+                               double arm_vel, double grip_vel, double max_axis_delta, double max_grip_delta,
+                               const a10_tcp::PolicyTrajectory::Velocity& velocity, double arm_acc,
+                               const a10_tcp::PolicyTrajectory::Velocity& acceleration = {}, double arm_jerk = 0.0)
+    { return policy_batch_.select_handoff(sequence, step_s, command, arm_vel, grip_vel, max_axis_delta, max_grip_delta,
+        velocity, arm_acc, acceleration, arm_jerk); }
+    bool policy_endpoint_velocity(std::uint64_t sequence, double step_s, double arm_vel,
+                                  a10_tcp::PolicyTrajectory::Velocity& velocity) const
+    { return policy_batch_.endpoint_velocity(sequence, step_s, arm_vel, velocity); }
     void clear_policy_tcp_targets_nrt();
     void record_policy_trace(A10PolicyTrace trace);
     std::atomic<bool> policy_running{false};

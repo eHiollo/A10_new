@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <vector>
+#include "a10_vr_joint_guard.hpp"
 
 namespace a10_tcp
 {
@@ -20,13 +21,14 @@ public:
     const std::vector<double>& step(const std::vector<double>& reference, double max_velocity, double max_acceleration)
     {
         constexpr double dt = 0.002;
+        max_acceleration = std::min(max_acceleration, VrJointGuard::acceleration);
         const double velocity_change = max_acceleration * dt;
         for (std::size_t axis = 0; axis < velocity_.size(); ++axis)
         {
             const double error = reference[axis] - position_[axis];
             const double braking_velocity = std::sqrt(velocity_change * velocity_change
                 + 2.0 * max_acceleration * std::abs(error)) - velocity_change;
-            const double desired_velocity = std::copysign(std::min(max_velocity, braking_velocity), error);
+            const double desired_velocity = std::copysign(std::min({max_velocity, VrJointGuard::speed_limit(axis), braking_velocity}), error);
             velocity_[axis] += std::clamp(desired_velocity - velocity_[axis], -velocity_change, velocity_change);
             position_[axis] += velocity_[axis] * dt;
         }
@@ -35,6 +37,12 @@ public:
     }
 
     const std::vector<double>& position() const { return position_; }
+
+    void accept(const std::vector<double>& command, const VrJointGuard::Joints& velocity)
+    {
+        position_ = command;
+        velocity_ = velocity;
+    }
 
     double lag(const std::vector<double>& reference) const
     {

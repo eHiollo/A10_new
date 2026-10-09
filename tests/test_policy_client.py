@@ -18,17 +18,120 @@ from robot_tcp_client import RobotTcpClient
 from runtime_logging import RuntimeLog
 import run_bridge
 from usb_camera import CameraConfig, ThreadedCamera
-from analyze_policy_log import analyze_retargets
+from analyze_policy_log import analyze_retargets, summarize
 
 
 class PolicyClientTests(unittest.TestCase):
+    def test_planned_trajectory_log_summary(self):
+        common = {"event": "retarget", "batch_seq": 1, "handoff_skip": 0,
+                  "handoff_duration_s": 0.3, "handoff_target_time_s": 0.0, "handoff_late_s": 0.3}
+        events = [{**common, "planned_trajectory": True, "handoff_fallback": True},
+                  {**common, "planned_trajectory": True, "handoff_fallback": False,
+                   "handoff_target_time_s": 0.6, "handoff_late_s": 0.001},
+                  {**common, "handoff_target_time_s": 0.5},
+                  {"event": "sample", "q0": [0.0] * 7, "actual": [0.0] * 7,
+                   "arm_vel": 0.785, "max_control_period_us": 2000, "max_control_work_us": 50,
+                   "planned_trajectory": True, "target_error_rad": 0.01, "active_plan_remaining_s": 0.2}]
+        record = {"event": "robot_status", "wall_time_ns": 1,
+                  "status": {"remaining": 1, "events": events, "async_handoff_planner": "cubic_pv_v1"}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            report = summarize(path)
+        self.assertEqual(report["future_handoffs"], 3)
+        self.assertEqual(report["handoff_fallbacks"], 1)
+        self.assertEqual(report["handoff_on_time_lateness_s"]["max"], 0.001)
+        self.assertEqual(report["planned_trajectory_samples"], 1)
+        self.assertEqual(report["trajectory_target_error_rad"]["max"], 0.01)
+        self.assertEqual(report["async_handoff_planners"], ["cubic_pv_v1"])
+        self.assertIsNone(report["command_jerk_max_rad_s3"])
+        self.assertEqual(report["following_error_window_max_rad_per_axis"], [None] * 6)
+
+    def test_jerk_trajectory_log_summary(self):
+        event = {"event": "sample", "q0": [0.0] * 7, "actual": [0.0] * 7,
+                 "arm_vel": 0.785, "max_control_period_us": 2000, "max_control_work_us": 300,
+                 "jerk_limited": True, "arm_jerk": 20.0, "max_command_jerk_rad_s3": 12.3,
+                 "max_following_error_rad": [0.001, 0.002, 0.003, 0.004, 0.005, 0.006]}
+        record = {"event": "robot_status", "wall_time_ns": 1,
+                  "status": {"remaining": 1, "events": [event], "async_handoff_planner": "quintic_discrete_pva_v1"}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            report = summarize(path)
+        self.assertEqual(report["command_jerk_max_rad_s3"]["max"], 12.3)
+        self.assertEqual(report["jerk_limited_samples"], 1)
+        self.assertEqual(report["arm_jerk_values"], [20.0])
+        self.assertEqual(report["following_error_window_max_rad_per_axis"][5]["max"], 0.006)
+        self.assertEqual(report["async_handoff_planners"], ["quintic_discrete_pva_v1"])
+
+    def test_async_ensemble_sends_fused_actions(self):
+        camera = SimpleNamespace(read_rgb=lambda: np.zeros((224, 224, 3), dtype=np.uint8))
+        robot = mock.Mock()
+        robot.get_follower_state.return_value = [0.0] * 7
+        robot.get_policy_status.return_value = {"remaining": 3, "policy_running": True,
+                                               "supports_async_smoothing": True, "batch_seq": 2,
+                                               "action_step_s": 1 / 30}
+        robot.last_batch_ack = {"batch_seq": 3}
+        websocket = mock.Mock()
+        websocket.infer.return_value = {"actions": np.zeros((30, 7))}
+        config = BridgeConfig("test", 10, 7, 0.005, 1.0, 0.0, 0.0, temporal_ensemble=True)
+        bridge = PiRobotBridge(websocket, robot, camera, None, config)
+        robot.send_policy_actions_batch.side_effect = lambda *args, **kwargs: bridge.stop() or 30
+        with mock.patch("bridge.TemporalEnsemble") as factory:
+            factory.return_value.fuse.return_value = (np.ones((30, 7)), {})
+            bridge.run_forever()
+            bridge._infer_thread.join(timeout=1.0)
+            factory.return_value.fuse.assert_called_once()
+        np.testing.assert_array_equal(robot.send_policy_actions_batch.call_args.args[0], np.ones((30, 7)))
+
     def test_policy_xml_declares_smoothing_acceleration(self):
         root = ET.parse(Path(__file__).resolve().parents[1] / "kaanh.xml").getroot()
         command = root.find(".//A10PolicyTcpDriver/Command")
         self.assertIsNotNone(command)
         params = {param.attrib["name"]: param.attrib["default"] for param in command.iter("Param")}
-        self.assertEqual(float(params["arm_acc"]), 0.5)
-        self.assertEqual(float(params["arm_vel"]), 0.05)
+        self.assertAlmostEqual(float(params["arm_acc"]), 1.5)
+        self.assertAlmostEqual(float(params["arm_vel"]), 0.3)
+        self.assertEqual(float(params["grip_vel"]), 50.0)
+        self.assertEqual(float(params["future_handoff"]), 1.0)
+        self.assertEqual(float(params["jerk_smooth"]), 0.0)
+        self.assertEqual(float(params["arm_jerk"]), 20.0)
+        self.assertEqual(float(params["max_axis_delta"]), 0.5)
+        self.assertEqual(float(params["max_grip_delta"]), 85.0)
+        source = (Path(__file__).resolve().parents[1] / "a10_policy_tcp_plan.cpp").read_text()
+        self.assertIn('name=\\"arm_vel\\" abbreviation=\\"a\\" default=\\"0.3\\"', source)
+        self.assertIn('name=\\"arm_acc\\" default=\\"1.5\\"', source)
+
+    def test_fixed_async_bridge_defaults(self):
+        args = build_arg_parser().parse_args([])
+        expected = {"policy_host": "192.168.110.119", "policy_port": 8000,
+                    "robot_host": "127.0.0.1", "robot_port": 8080, "mode": "async",
+                    "right_camera": "0", "top_camera": "2", "right_rotate_180": True,
+                    "top_rotate_180": False, "camera_mode": "threaded", "camera_width": 640,
+                    "camera_height": 480, "hz": 10.0, "action_dim": 7, "buffer_target": 1,
+                    "async_smoothing": True, "temporal_ensemble": True, "ensemble_decay": 0.01,
+                    "ensemble_gripper": True}
+        for name, value in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(getattr(args, name), value)
+        config = BridgeConfig("test", 10, 7, 0.005, 1.0, 0.0, 0.0)
+        self.assertTrue(config.temporal_ensemble)
+        self.assertTrue(config.ensemble_gripper)
+        self.assertEqual(config.ensemble_decay, 0.01)
+
+    def test_ensemble_default_preserves_mode_overrides(self):
+        parser = build_arg_parser()
+        self.assertFalse(parser.parse_args(["--no-temporal-ensemble"]).temporal_ensemble)
+        self.assertTrue(parser.parse_args(["--temporal-ensemble"]).temporal_ensemble)
+        self.assertFalse(parser.parse_args(["--no-ensemble-gripper"]).ensemble_gripper)
+        for mode in ("sync", "pipeline"):
+            with self.subTest(mode=mode):
+                self.assertFalse(parser.parse_args(["--mode", mode]).temporal_ensemble)
+                self.assertFalse(parser.parse_args(["--mode", mode, "--no-temporal-ensemble"]).temporal_ensemble)
+                args = parser.parse_args(["--mode", mode, "--temporal-ensemble"])
+                with mock.patch("bridge.OpenPIWebsocketClient") as factory:
+                    with self.assertRaisesRegex(ValueError, "only supports --mode async"):
+                        run_from_args(args)
+                    factory.assert_not_called()
 
     def test_async_smoothing_switch_and_wire(self):
         self.assertTrue(build_arg_parser().parse_args([]).async_smoothing)
@@ -93,8 +196,10 @@ class PolicyClientTests(unittest.TestCase):
             args = runner.call_args.args[0]
             self.assertEqual(args.hz, 30)
             self.assertEqual(args.log_dir, directory)
+            self.assertTrue(args.temporal_ensemble)
             records = [json.loads(line) for line in next(Path(directory).glob("run_*/events.jsonl")).read_text().splitlines()]
             self.assertEqual([record["event"] for record in records], ["session_start", "session_end"])
+            self.assertTrue(records[0]["config"]["temporal_ensemble"])
 
     def test_invalid_actions_and_observations_are_rejected(self):
         for actions in (np.zeros((0, 7)), np.full((2, 7), np.nan), np.full((2, 7), np.inf)):

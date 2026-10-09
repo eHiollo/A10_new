@@ -31,6 +31,8 @@ def analyze_retargets(inference, sends, events):
         observation_drift = [command - origin for command, origin in zip(event["q0"][:6], state)]
         applied_delta = [goal - command for goal, command in zip(event["q1"][:6], event["q0"][:6])]
         matched.append({"batch_seq": event["batch_seq"], "prefix_skip": event["prefix_skip"],
+                        "handoff_skip": event.get("handoff_skip", 0),
+                        "selected_action_index": event["prefix_skip"] + event.get("handoff_skip", 0),
                         "model_delta_from_observation": target_delta, "command_drift_since_observation": observation_drift,
                         "applied_delta": applied_delta, "first_segment_s": event["n_steps"] / 500.0})
     return {
@@ -55,6 +57,13 @@ def summarize(path: Path) -> dict:
             except json.JSONDecodeError:
                 incomplete_lines += 1
     inference = [record for record in records if record.get("event") == "inference"]
+    ensemble_records = [record for record in records if record.get("event") == "temporal_ensemble"]
+    inference_by_actions = {json.dumps(record["actions"]): record for record in inference}
+    target_predictions = list(inference)
+    for record in ensemble_records:
+        original = inference_by_actions.get(json.dumps(record["raw_actions"]))
+        if original is not None:
+            target_predictions.append({**original, "actions": record["actions"]})
     sends = [record for record in records if record.get("event") == "batch_sent"]
     async_sends = [record for record in records if record.get("event") == "async_send"]
     statuses = [record["status"] for record in records if record.get("event") == "robot_status"]
@@ -62,6 +71,8 @@ def summarize(path: Path) -> dict:
     samples = [event for event in events if event.get("event") == "sample"]
     following_error = [max(abs(target - actual) for target, actual in zip(event["q0"][:6], event["actual"][:6])) for event in samples]
     alignment = [event for event in events if event.get("event") == "align"]
+    handoffs = [event for event in events if event.get("event") in ("segment", "retarget")
+                and (event.get("handoff_target_time_s", 0.0) > 0.0 or event.get("planned_trajectory", False))]
     empty_by_sequence = {}
     for record in records:
         if record.get("event") != "robot_status":
@@ -80,6 +91,7 @@ def summarize(path: Path) -> dict:
         "log": str(path), "records": len(records), "incomplete_lines": incomplete_lines,
         "session": next((record for record in records if record.get("event") == "session_start"), None),
         "controller_builds": sorted({status["controller_build"] for status in statuses if "controller_build" in status}),
+        "async_handoff_planners": sorted({status["async_handoff_planner"] for status in statuses if "async_handoff_planner" in status}),
         "raw_action_shapes": dict(Counter(str(record.get("raw_action_shape")) for record in inference)),
         "inference_roundtrip_ms": distribution([record["inference_roundtrip_ms"] for record in inference]),
         "transport_timing_ms": {name: distribution([record["transport_timing"][name] for record in inference
@@ -89,7 +101,9 @@ def summarize(path: Path) -> dict:
                                           if isinstance(record.get("server_timing"), dict) and "infer_ms" in record["server_timing"]]),
         "policy_infer_ms": distribution([record["policy_timing"]["infer_ms"] for record in inference
                                           if isinstance(record.get("policy_timing"), dict) and "infer_ms" in record["policy_timing"]]),
-        "retarget_analysis": analyze_retargets(inference, sends, events),
+        "retarget_analysis": analyze_retargets(target_predictions, sends, events),
+        "temporal_ensemble_batches": len(ensemble_records),
+        "temporal_ensemble_max_contributors": max((max(record["contributors_per_step"]) for record in ensemble_records), default=0),
         "sent_observation_age_s": distribution([record["obs_age_s"] for record in sends if record.get("obs_age_s") is not None]),
         "batch_ack_rtt_ms": distribution([record["ack_rtt_ms"] for record in sends]),
         "sent_batches": len(sends),
@@ -103,6 +117,13 @@ def summarize(path: Path) -> dict:
         "aligned_batches": len(alignment),
         "fully_expired_batches": len({event["batch_seq"] for event in alignment if event["remaining"] == 0 and event["prefix_skip"] > 0}),
         "prefix_skip": distribution([event["prefix_skip"] for event in alignment]),
+        "future_handoffs": len(handoffs),
+        "handoff_additional_skip": distribution([event["handoff_skip"] for event in handoffs]),
+        "handoff_duration_s": distribution([event["handoff_duration_s"] for event in handoffs]),
+        "handoff_nominal_lateness_s": distribution([event["handoff_late_s"] for event in handoffs]),
+        "handoff_fallbacks": sum(bool(event.get("handoff_fallback")) for event in handoffs),
+        "handoff_on_time_lateness_s": distribution([event["handoff_late_s"] for event in handoffs
+                                                     if event.get("planned_trajectory") and not event.get("handoff_fallback")]),
         "controller_events": dict(Counter(event["event"] for event in events)),
         "max_axis_following_error_rad": distribution(following_error),
         "control_period_max_us_per_sample": distribution([event["max_control_period_us"] for event in samples]),
@@ -112,7 +133,15 @@ def summarize(path: Path) -> dict:
         "smoothing_samples": sum(bool(event.get("smoothing")) for event in samples),
         "command_velocity_max_rad_s": distribution([event["max_command_vel_rad_s"] for event in samples if "max_command_vel_rad_s" in event]),
         "command_acceleration_max_rad_s2": distribution([event["max_command_acc_rad_s2"] for event in samples if "max_command_acc_rad_s2" in event]),
+        "command_jerk_max_rad_s3": distribution([event["max_command_jerk_rad_s3"] for event in samples if "max_command_jerk_rad_s3" in event]),
+        "jerk_limited_samples": sum(bool(event.get("jerk_limited")) for event in samples),
+        "arm_jerk_values": sorted({event["arm_jerk"] for event in samples if "arm_jerk" in event}),
+        "following_error_window_max_rad_per_axis": [distribution([event["max_following_error_rad"][axis]
+            for event in samples if len(event.get("max_following_error_rad", [])) == 6]) for axis in range(6)],
         "reference_lag_rad": distribution([event["reference_lag_rad"] for event in samples if "reference_lag_rad" in event]),
+        "planned_trajectory_samples": sum(bool(event.get("planned_trajectory")) for event in samples),
+        "active_plan_remaining_s": distribution([event["active_plan_remaining_s"] for event in samples if "active_plan_remaining_s" in event]),
+        "trajectory_target_error_rad": distribution([event["target_error_rad"] for event in samples if event.get("planned_trajectory")]),
         "camera_age_s": {name: distribution([record["cameras"][name]["age_s"] for record in inference if record["cameras"].get(name)]) for name in ("right", "top")},
         "state_age_s": distribution([status["state_age_s"] for status in statuses if "state_age_s" in status]),
         "trace_dropped": max((status.get("trace_dropped", 0) for status in statuses), default=0),
