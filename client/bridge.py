@@ -113,6 +113,7 @@ class PiRobotBridge:
         return _state_7d(self._robot.get_follower_state())
 
     def _infer_chunk(self, state_7d: np.ndarray) -> np.ndarray:
+        log_session = getattr(self._log, "session_id", None)
         started = time.monotonic()
         obs = self._build_observation(state_7d)
         observed = time.monotonic()
@@ -123,7 +124,10 @@ class PiRobotBridge:
         self._last_infer_result = infer_result
         chunk = _extract_action_chunk(infer_result, expected_dim=self._cfg.action_dim)
         if self._log is not None:
-            self._log.write("inference", state=state_7d, state_info=self._robot.last_state_info,
+            emit = self._log.write
+            if hasattr(self._log, "write_for_session"):
+                emit = lambda event, **fields: self._log.write_for_session(log_session, event, **fields)
+            emit("inference", state=state_7d, state_info=self._robot.last_state_info,
                             cameras={"right": self._right_cam.last_frame_info,
                                      "top": self._top_cam.last_frame_info if self._top_cam is not None else None},
                             observation_ms=(observed - started) * 1000.0,
@@ -443,8 +447,8 @@ class BridgeArgumentParser(argparse.ArgumentParser):
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = BridgeArgumentParser(description="Bridge OpenPI websocket inference with this repo's a10_tcp_server (TCP).")
-    parser.add_argument("--log-dir", default=str(Path(__file__).resolve().parent / "logs"), help="每次运行创建独立日志目录。")
+    parser = BridgeArgumentParser(allow_abbrev=False, description="Bridge OpenPI websocket inference with this repo's a10_tcp_server (TCP).")
+    parser.add_argument("--log-dir", default=str(Path(__file__).resolve().parent / "logs"), help="日志根目录；由控制器 policy --log=1/0 控制，每次 policy 新建独立目录。")
     parser.add_argument("--camera-max-age", type=float, default=0.5, help="仅日志标记：相机缓存帧过旧阈值（秒），不阻止 bridge 运行。")
     parser.add_argument("--infer-timeout", type=float, default=60.0, help="推理回包超时（秒），需包含首次预热。")
     parser.add_argument("--policy-host", type=str, default="192.168.110.119")

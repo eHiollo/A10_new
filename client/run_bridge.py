@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 
 from bridge import build_arg_parser, run_from_args
-from runtime_logging import RuntimeLog
+from runtime_logging import PolicyLogSession
 
 
 def main() -> None:
@@ -14,7 +14,7 @@ def main() -> None:
     )
     parser = build_arg_parser()
     args = parser.parse_args()
-    runtime_log = RuntimeLog(args.log_dir, vars(args))
+    runtime_log = PolicyLogSession(args.log_dir, vars(args))
     try:
         run_from_args(args, runtime_log=runtime_log)
     except BaseException as exc:

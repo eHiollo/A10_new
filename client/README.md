@@ -1,5 +1,17 @@
 # client（VLA / OpenPI 桥接）
 
+## kaanh 整合版（2026-10-15）
+
+保留 2026-10-09 RTC 实机默认值和 async/sync/pipeline。日志由控制器
+`policy --log=1`（默认）或 `policy --log=0` 控制；bridge 常驻期间，每次
+policy 启动创建独立日志目录，停止后关闭文件。`--log-dir` 指定根目录。
+日志保持 RTC 的 `events.jsonl`、`bridge.log` 和首次观测图像格式，继续使用
+`python client/analyze_policy_log.py` 分析。旧控制器缺少日志状态字段时不启用文件日志。
+
+启动控制器会尝试 Manufacturer 自动登录；失败保留原有诊断，不输出密码。
+动态密码工具参见 [登录说明](KAANH_PASSPORT.md)。本轮未整合 TTC 多候选验证和旧 VR 末端接口。
+
+
 ## 当前固定配置（2026-10-09）
 
 按用户确认，固定13:54第二轮实机参数为默认值，只更改默认配置，不更改轨迹或融合算法：

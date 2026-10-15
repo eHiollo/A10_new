@@ -80,3 +80,69 @@ class RuntimeLog:
         self._handler.close()
         with self._lock:
             self._file.close()
+
+
+class PolicyLogSession:
+    """Thread-safe RTC log sink following the controller's policy sessions.
+
+    Constructing the bridge creates no files. Missing controller logging fields
+    leave file logging disabled.
+    """
+
+    def __init__(self, root: str, config: dict | None = None) -> None:
+        self.root = root
+        self.config = config or {}
+        self.session_id: str | None = None
+        self._log: RuntimeLog | None = None
+        self._lock = threading.RLock()
+        self._closed = False
+
+    @property
+    def session_dir(self) -> Path | None:
+        with self._lock:
+            return self._log.path if self._log else None
+
+    def sync(self, status: dict) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            session = status.get("log_session")
+            enabled = (status.get("policy_running") is True
+                       and status.get("log_enabled") is True
+                       and isinstance(session, str) and session not in ("", "0"))
+            if not all(key in status for key in ("policy_running", "log_enabled", "log_session")):
+                # Unknown logging state must never turn file logging on.
+                enabled = False
+            if self._log and (not enabled or session != self.session_id):
+                self._finish("policy_stopped_or_replaced")
+            if enabled and self._log is None:
+                self._log = RuntimeLog(self.root, self.config)
+                self.session_id = session
+                self._log.write("policy_session_start", policy_session=session)
+
+    def _finish(self, reason: str) -> None:
+        if self._log:
+            self._log.write("policy_session_end", policy_session=self.session_id, reason=reason)
+            self._log.close()
+            self._log = None
+        self.session_id = None
+
+    def write(self, event: str, **fields) -> None:
+        with self._lock:
+            if self._log:
+                self._log.write(event, **fields)
+
+    def write_for_session(self, session_id: str | None, event: str, **fields) -> None:
+        with self._lock:
+            if self.session_id == session_id and self._log:
+                self._log.write(event, **fields)
+
+    def save_observation_images(self, observation: dict) -> None:
+        with self._lock:
+            if self._log:
+                self._log.save_observation_images(observation)
+
+    def close(self, *, reason: str = "bridge_exit") -> None:
+        with self._lock:
+            self._finish(reason)
+            self._closed = True

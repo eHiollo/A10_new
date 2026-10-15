@@ -289,6 +289,7 @@ namespace robot
 
         // m_init：preset 0..5 对应六组初始关节目标
         int preset_index = 0;
+        double unused_hold_q[6]{};
 
         //Flag
         bool init = false;
@@ -334,7 +335,7 @@ namespace robot
 		auto& arm1 = dualArm.subModels().at(0);
 		auto& model_a1 = dynamic_cast<aris::dynamic::Model&>(arm1);
 		auto& eeA1 = dynamic_cast<aris::dynamic::GeneralMotion&>(model_a1.generalMotionPool().at(0));
-		const bool dual = submodel_count(*this) >= 2;
+		const bool dual = submodel_count(*this) >= 2 && motor_count(*this) >= 12;
 		aris::dynamic::Model* model_a2 = nullptr;
 		aris::dynamic::GeneralMotion* eeA2 = nullptr;
 		if (dual)
@@ -408,6 +409,9 @@ namespace robot
                 p = 0;
             }
             imp_->preset_index = p;
+            if (dual)
+                for (int axis = 0; axis < 6; ++axis)
+                    imp_->unused_hold_q[axis] = controller()->motorPool()[axis + 6].actualPos();
             mout() << "m_init: preset=" << imp_->preset_index << std::endl;
 
             getForceData(imp_->arm1_init_force, 0, imp_->init);
@@ -422,7 +426,10 @@ namespace robot
             imp_->init = true;
         }
 
-        const double *const init_pos = a10_init::preset_joints(imp_->preset_index);
+        double init_pos[12]{};
+        std::copy_n(a10_init::preset_joints(imp_->preset_index), 12, init_pos);
+        if (dual)
+            std::copy_n(imp_->unused_hold_q, 6, init_pos + 6);
 
         //6-12维反向
         // static double init_pos[12] =
@@ -517,7 +524,7 @@ namespace robot
 
         auto motorsPositionCheck = [=]()
         {
-            const int n_check = dual ? 12 : n_axis;
+            const int n_check = n_axis;
             for(int i = 0; i < n_check; i++)
             {
                 if(std::fabs(current_angle[i]-init_pos[i])>=move)
@@ -531,7 +538,7 @@ namespace robot
 
 
 
-        const int n_move = dual ? 12 : n_axis;
+        const int n_move = n_axis;
         for (int i = 0; i < n_move; i++)
         {
             if (static_cast<aris::Size>(i) >= motor_count(*this))
@@ -548,9 +555,10 @@ namespace robot
             }
         }
 
-
-
-
+        // The unused arm holds its captured feedback, never a preset pose.
+        if (dual)
+            for (int axis = 0; axis < 6; ++axis)
+                controller()->motorPool()[axis + 6].setTargetPos(imp_->unused_hold_q[axis]);
 
         if (count() % 1000 == 0)
         {

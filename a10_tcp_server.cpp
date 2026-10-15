@@ -334,6 +334,7 @@ bool A10TcpServer::fetch_ee_anchor_if_updated(
 
 void A10TcpServer::send_policy_status(int client_sock)
 {
+    const auto log_state = policy_log_state_.snapshot();
     const auto status = policy_batch_.status();
     nlohmann::json result = {
         {"policy_protocol_version", 2}, {"controller_build", __DATE__ " " __TIME__},
@@ -359,7 +360,9 @@ void A10TcpServer::send_policy_status(int client_sock)
         {"handoff_late_s", status.handoff_late_s},
         {"handoff_fallback", status.handoff_fallback},
         {"aligned", status.aligned}, {"expired", status.expired},
-        {"policy_running", policy_running.load()}, {"action_step_s", 1.0 / 30.0},
+        {"policy_running", policy_running.load()},
+        {"log_enabled", log_state.enabled},
+        {"log_session", std::to_string(log_state.session)}, {"action_step_s", 1.0 / 30.0},
         {"motor_checks_disabled", true},
         {"trace_dropped", policy_trace_dropped_.load()}};
     {
@@ -552,6 +555,7 @@ void A10TcpServer::process_line(
     if (line.find("STOP_POLICY") != std::string::npos)
     {
         a10_tcp::g_a10_policy_tcp_stop_requested.store(true, std::memory_order_release);
+        policy_log_state_.stop();
         clear_policy_tcp_targets_nrt();
         send_line_to_client(client_sock, "{\"stopped\":true}\n");
         return;

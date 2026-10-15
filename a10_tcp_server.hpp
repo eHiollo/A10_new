@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "a10_anchor_protocol.hpp"
+#include "a10_policy_log_state.hpp"
 #include "a10_policy_batch.hpp"
 
 struct A10PolicyTrace
@@ -112,7 +113,10 @@ public:
     void clear_ee_anchor_target_nrt();
     std::uint64_t ee_anchor_seq() const;
 
+    a10_tcp::PolicyLogState& policy_log_state() { return policy_log_state_; }
+
 private:
+    a10_tcp::PolicyLogState policy_log_state_;
     void acceptLoop();
     void readerLoop(int client_sock);
     bool send_line(const std::string& line);

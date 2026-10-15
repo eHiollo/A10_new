@@ -93,9 +93,13 @@ class RobotTcpClient:
                 line = self._recv_line()
                 result = json.loads(line)
                 if self._runtime_log is not None and command == "GET_POLICY_STATUS":
+                    if hasattr(self._runtime_log, "sync"):
+                        self._runtime_log.sync(result)
                     self._runtime_log.write("robot_status", status=result)
                 return result
             except Exception:  # noqa: BLE001
+                if command == "GET_POLICY_STATUS" and hasattr(self._runtime_log, "sync"):
+                    self._runtime_log.sync({})
                 logger.exception("Robot TCP request failed: %s", command)
                 self.close()
                 raise

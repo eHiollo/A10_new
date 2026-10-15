@@ -1645,6 +1645,7 @@
             <A10PolicyTcpDriver name="plan">
                 <Command __prop_name__="command" name="policy">
                     <GroupParam name="group_param">
+                        <Param name="log" abbreviation="l" default="1"/>
                         <Param name="arm_vel" abbreviation="a" default="0.3"/>
                         <Param name="arm_acc" default="1.5"/>
                         <Param name="future_handoff" default="1"/>

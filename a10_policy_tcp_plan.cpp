@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -324,6 +325,7 @@ bool legacy_target_changed(const std::vector<double>& tq, const std::vector<doub
 
 struct A10PolicyTcpDriver::Imp
 {
+    std::uint64_t log_session_token_{0};
     JointSegment batch_seg;
     JointSegment legacy_seg;
     std::vector<double> last_legacy_target;
@@ -438,6 +440,7 @@ struct A10PolicyTcpDriver::Imp
         trace.command_acceleration_rad_s2 = guarded_acceleration_;
         g_tcp_server->record_policy_trace(trace);
         g_a10_policy_tcp_stop_requested.store(true, std::memory_order_release);
+        g_tcp_server->policy_log_state().stop();
     }
 
     void idle_motion(A10PolicyTcpDriver& self, std::uint64_t empty_sequence)
@@ -794,6 +797,11 @@ struct A10PolicyTcpDriver::Imp
 
 auto A10PolicyTcpDriver::prepareNrt() -> void
 {
+    const double log_value = doubleParam("log");
+    if (log_value != 0.0 && log_value != 1.0)
+        throw std::invalid_argument("policy --log must be 0 or 1");
+    imp_->log_session_token_ = g_tcp_server
+        ? g_tcp_server->policy_log_state().prepare(log_value == 1.0) : 0;
     const double arm_acc = cmdParams().find("arm_acc") == cmdParams().end() ? 1.5 : doubleParam("arm_acc");
     if (!std::isfinite(arm_acc) || arm_acc <= 0.0)
         throw std::invalid_argument("arm_acc must be finite and positive");
@@ -874,6 +882,7 @@ auto A10PolicyTcpDriver::executeRT() -> int
 
     if (count() == 1)
     {
+        g_tcp_server->policy_log_state().start(imp_->log_session_token_);
         auto& motors = controller()->motorPool();
         if (motors.size() < 6)
         {
@@ -1089,6 +1098,7 @@ A10PolicyTcpDriver::A10PolicyTcpDriver(const std::string& name) : imp_(new Imp)
         command(),
         "<Command name=\"policy\">"
         "  <GroupParam name=\"group_param\">"
+        "    <Param name=\"log\" abbreviation=\"l\" default=\"1\"/>"
         "    <Param name=\"arm_vel\" abbreviation=\"a\" default=\"0.3\"/>"
         "    <Param name=\"arm_acc\" default=\"1.5\"/>"
         "    <Param name=\"future_handoff\" default=\"1\"/>"
@@ -1106,6 +1116,7 @@ auto A10PolicyTcpDriver::collectNrt() -> void
 {
     if (g_tcp_server != nullptr)
     {
+        g_tcp_server->policy_log_state().finish(imp_->log_session_token_);
         g_tcp_server->policy_running.store(false);
         g_tcp_server->policy_motion_settling.store(false);
     }
@@ -1114,6 +1125,7 @@ KAANH_DEFINE_BIG_FOUR_CPP(A10PolicyTcpDriver)
 
 auto A10PolicyTcpCliStop::prepareNrt() -> void
 {
+    if (g_tcp_server != nullptr) g_tcp_server->policy_log_state().stop();
     for (auto& m : motorOptions())
     {
         m = aris::plan::Plan::CHECK_NONE | aris::plan::Plan::NOT_CHECK_POS_CONTINUOUS_SECOND_ORDER;

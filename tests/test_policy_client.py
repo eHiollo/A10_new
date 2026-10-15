@@ -187,7 +187,7 @@ class PolicyClientTests(unittest.TestCase):
         self.assertAlmostEqual(report["recent_batches"][0]["applied_delta"][3], 0.012)
         self.assertEqual(analyze_retargets([], [], [event])["matched_batches"], 0)
 
-    def test_user_startup_command_creates_session(self):
+    def test_user_startup_waits_for_policy_before_creating_session(self):
         with tempfile.TemporaryDirectory() as directory:
             argv = ["run_bridge.py", "--policy-host", "192.168.110.119", "--policy-port", "8000",
                     "--robot-host", "127.0.0.1", "--robot-port", "8080", "--hz", "30", "--log-dir", directory]
@@ -197,9 +197,8 @@ class PolicyClientTests(unittest.TestCase):
             self.assertEqual(args.hz, 30)
             self.assertEqual(args.log_dir, directory)
             self.assertTrue(args.temporal_ensemble)
-            records = [json.loads(line) for line in next(Path(directory).glob("run_*/events.jsonl")).read_text().splitlines()]
-            self.assertEqual([record["event"] for record in records], ["session_start", "session_end"])
-            self.assertTrue(records[0]["config"]["temporal_ensemble"])
+            self.assertEqual(list(Path(directory).iterdir()), [])
+            self.assertIsNone(runner.call_args.kwargs["runtime_log"].session_id)
 
     def test_invalid_actions_and_observations_are_rejected(self):
         for actions in (np.zeros((0, 7)), np.full((2, 7), np.nan), np.full((2, 7), np.inf)):
