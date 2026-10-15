@@ -83,14 +83,10 @@ target_link_libraries(kaanhbin PUBLIC
     ${kaanhbot_LIBRARIES}
     ${rtb_LIBRARIES}
 )
+target_compile_definitions(kaanhbin PRIVATE KAANH_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 set_target_properties(kaanhbin PROPERTIES
     BUILD_RPATH "${PROJECT_SOURCE_DIR}/vendor/rtb-1.0.0/lib;/opt/etherlab/lib;/usr/kaanhbot/kaanhbot-2.5.7/lib/release;/usr/kaanh/kaanh-2.5.7/lib/release;/usr/aris/aris-2.5.7/lib/release"
     INSTALL_RPATH "${PROJECT_SOURCE_DIR}/vendor/rtb-1.0.0/lib;/opt/etherlab/lib;/usr/kaanhbot/kaanhbot-2.5.7/lib/release;/usr/kaanh/kaanh-2.5.7/lib/release;/usr/aris/aris-2.5.7/lib/release"
-)
-add_custom_command(TARGET kaanhbin POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${PROJECT_SOURCE_DIR}/kaanh.xml
-        $<TARGET_FILE_DIR:kaanhbin>/kaanh.xml
 )
 
 add_executable(client ${PROJECT_SOURCE_DIR}/client.cpp)
