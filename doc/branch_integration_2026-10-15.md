@@ -1,6 +1,7 @@
-# kaanh 实机主线整合（2026-10-15）
+# kaanh_test 实机主线整合（2026-10-15）
 
-整合目标为本地 `kaanh`，不推送远端，不删除旧分支或 stash。
+整合结果保存在本地 `kaanh_test`，用于后续实机验证；不推送远端，不删除旧分支或 stash。
+本地 `kaanh` 恢复到合并前的 `59ef1fd`，验证完成后再决定合入。
 整合前本地 kaanh：`59ef1fd`；远端 kaanh：`1470e10`。
 备份分支：`backup/kaanh-before-integration-20261015`。
 
@@ -41,4 +42,4 @@ ctest --test-dir build/integration --output-on-failure
 Python 40 项通过。C++ 9 个离线测试程序通过：锚点/reset 协议、batch、handoff、三次/五次轨迹、平滑器、关节诊断、关节保护、日志生命周期。另有 SDK 登录测试通过，完整控制器构建通过。
 离线 C++ 测试使用 g++ -std=c++17 -O2 -pthread，包含项目根目录和 vendor/rtb-1.0.0/include；锚点测试额外链接 a10_anchor_protocol.cpp。
 
-不启动控制器、不发送运动指令。本次没有进行实机验收；m_init 双臂保持行为及整合后任务效果仍需现场核验。
+整合过程未启动控制器或发送运动指令。用户已确认免密登录实机验证通过；其余整合功能待用户后续验证，m_init 双臂保持行为及任务效果仍需现场核验。
