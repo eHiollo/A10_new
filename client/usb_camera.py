@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
+from openpi_client import image_tools
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,7 @@ class CameraConfig:
     rotate_180: bool = False
     """每帧独占打开/读取/释放，避免多相机同时占用 USB 导致读帧失败。"""
     exclusive_per_read: bool = False
+    max_frame_age_s: float = 0.5
 
 
 class USBCamera:
@@ -66,6 +69,7 @@ class USBCamera:
     def __init__(self, cfg: CameraConfig) -> None:
         self._cfg = cfg
         self._cap: cv2.VideoCapture | None = None
+        self.last_frame_info: dict = {}
         if not self._cfg.exclusive_per_read:
             self._open_persistent()
 
@@ -118,8 +122,33 @@ class USBCamera:
 
     def read_rgb(self) -> np.ndarray:
         if self._cfg.exclusive_per_read:
-            return self._read_exclusive()
-        return self._read_persistent()
+            frame = self._read_exclusive()
+        else:
+            frame = self._read_persistent()
+        self.last_frame_info = {"source": self._cfg.source, "rotate_180": self._cfg.rotate_180,
+                                "age_s": 0.0, "read_monotonic_s": time.monotonic(), "shape": list(frame.shape)}
+        return frame
+
+    @staticmethod
+    def as_policy_hwc(frame_rgb: np.ndarray) -> np.ndarray:
+        """推理图像：RGB、HWC、uint8，等比缩到 224×224 再补黑边。
+
+        与训练时 ``openpi_client.image_tools.resize_with_pad`` 一致，不直接拉伸。
+        """
+        frame = np.asarray(frame_rgb)
+        if frame.ndim != 3 or frame.shape[-1] < 3 or frame.size == 0:
+            raise RuntimeError(f"invalid camera frame shape={getattr(frame, 'shape', None)}")
+        frame = frame[..., :3]
+        if np.issubdtype(frame.dtype, np.floating):
+            max_v = float(np.max(frame)) if frame.size > 0 else 0.0
+            if max_v <= 1.01:
+                frame = (np.clip(frame, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+            else:
+                frame = np.clip(frame, 0.0, 255.0).round().astype(np.uint8)
+        else:
+            frame = frame.astype(np.uint8, copy=False)
+        frame = image_tools.convert_to_uint8(image_tools.resize_with_pad(frame, 224, 224))
+        return np.ascontiguousarray(frame, dtype=np.uint8)
 
     @staticmethod
     def preprocess_to_policy_chw(frame_rgb: np.ndarray, size: int = 224) -> np.ndarray:
@@ -144,3 +173,83 @@ class USBCamera:
         if self._cap is not None:
             self._cap.release()
             self._cap = None
+
+
+class ThreadedCamera:
+    """后台线程持续抓帧，``read_rgb`` 立刻返回最新一帧。
+
+    异步推理时避免每次观测都 open/read/close。两路相机可以各自持有句柄。
+    """
+
+    def __init__(self, cfg: CameraConfig) -> None:
+        self._cfg = cfg
+        self._stop = threading.Event()
+        self._frame_lock = threading.Lock()
+        self._latest: np.ndarray | None = None
+        self._latest_at = 0.0
+        self.last_frame_info: dict = {}
+        self._open_error: Exception | None = None
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+
+    def _capture_loop(self) -> None:
+        source = _parse_source(self._cfg.source)
+        cap: cv2.VideoCapture | None = None
+        while not self._stop.is_set():
+            try:
+                if cap is None or not cap.isOpened():
+                    if cap is not None:
+                        cap.release()
+                    if self._cfg.exclusive_per_read:
+                        with _USB_CAPTURE_LOCK:
+                            cap = cv2.VideoCapture(source)
+                    else:
+                        cap = cv2.VideoCapture(source)
+                    if not cap.isOpened():
+                        raise RuntimeError(f"Failed to open USB camera source={self._cfg.source}")
+                    _configure_capture(cap, self._cfg.width, self._cfg.height)
+                    self._open_error = None
+                ok, frame_bgr = cap.read()
+                if not ok or frame_bgr is None:
+                    cap.release()
+                    cap = None
+                    continue
+                frame_rgb = _bgr_to_rgb(frame_bgr, self._cfg.rotate_180)
+                with self._frame_lock:
+                    self._latest = frame_rgb
+                    self._latest_at = time.monotonic()
+            except Exception as exc:  # noqa: BLE001
+                self._open_error = exc
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    cap = None
+                if not self._stop.is_set():
+                    time.sleep(0.2)
+        if cap is not None:
+            cap.release()
+
+    def read_rgb(self) -> np.ndarray:
+        t0 = time.time()
+        while True:
+            with self._frame_lock:
+                frame = self._latest
+                err = self._open_error
+                frame_at = self._latest_at
+            if frame is not None:
+                age = time.monotonic() - frame_at
+                self.last_frame_info = {"source": self._cfg.source, "rotate_180": self._cfg.rotate_180,
+                                        "age_s": age, "stale": age > self._cfg.max_frame_age_s,
+                                        "read_monotonic_s": frame_at, "shape": list(frame.shape)}
+                return frame
+            if err is not None and time.time() - t0 > 2.0:
+                raise RuntimeError(f"ThreadedCamera source={self._cfg.source} failed: {err}")
+            if time.time() - t0 > 5.0:
+                raise RuntimeError(f"ThreadedCamera source={self._cfg.source} timed out waiting first frame")
+            time.sleep(0.02)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)

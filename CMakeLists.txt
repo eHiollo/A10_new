@@ -41,6 +41,7 @@ set(KAANHBIN_SOURCES
     plan.cpp
     robot.cpp
     a10_tcp_server.cpp
+    a10_anchor_protocol.cpp
     a10_policy_tcp_plan.cpp
     a10_vr_plan.cpp
     a10_vr_vel_plan.cpp
@@ -75,6 +76,7 @@ endif()
 
 include_directories(${PROJECT_SOURCE_DIR})
 add_executable(kaanhbin ${KAANHBIN_SOURCES})
+target_compile_definitions(kaanhbin PRIVATE KAANH_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_include_directories(kaanhbin PUBLIC 
     ${PROJECT_BINARY_DIR}
     ${rtb_INCLUDE_DIRS}
@@ -83,11 +85,22 @@ target_link_libraries(kaanhbin PUBLIC
     ${kaanhbot_LIBRARIES}
     ${rtb_LIBRARIES}
 )
-target_compile_definitions(kaanhbin PRIVATE KAANH_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 set_target_properties(kaanhbin PROPERTIES
     BUILD_RPATH "${PROJECT_SOURCE_DIR}/vendor/rtb-1.0.0/lib;/opt/etherlab/lib;/usr/kaanhbot/kaanhbot-2.5.7/lib/release;/usr/kaanh/kaanh-2.5.7/lib/release;/usr/aris/aris-2.5.7/lib/release"
     INSTALL_RPATH "${PROJECT_SOURCE_DIR}/vendor/rtb-1.0.0/lib;/opt/etherlab/lib;/usr/kaanhbot/kaanhbot-2.5.7/lib/release;/usr/kaanh/kaanh-2.5.7/lib/release;/usr/aris/aris-2.5.7/lib/release"
 )
+set(KAANHBIN_RUNTIME_DIR "${CMAKE_CURRENT_BINARY_DIR}/bin")
+add_custom_target(sync_kaanh_xml ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        ${KAANHBIN_RUNTIME_DIR}
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${PROJECT_SOURCE_DIR}/kaanh.xml
+        ${KAANHBIN_RUNTIME_DIR}/kaanh.xml
+    DEPENDS ${PROJECT_SOURCE_DIR}/kaanh.xml
+    COMMENT "Syncing kaanh.xml to the runtime directory"
+    VERBATIM
+)
+add_dependencies(kaanhbin sync_kaanh_xml)
 
 add_executable(client ${PROJECT_SOURCE_DIR}/client.cpp)
 target_include_directories(client PUBLIC ${PROJECT_BINARY_DIR})

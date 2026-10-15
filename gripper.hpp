@@ -59,6 +59,13 @@ public:
   uint8_t get_position(uint8_t servo_id);
   double get_position_mm(uint8_t servo_id,const std::string& gripper_type);
 
+  // 读回夹爪开口（mm）。返回 false 表示串口/舵机读取失败。
+  // 调用方必须区分“读取失败”和“真的在 0 mm（闭合）”——不要把 0 当错误码用，
+  // 否则读失败会被静默当成“夹爪已完全闭合”，使闭合指令被判定为“无变化”而不下发。
+  bool try_get_position_mm(uint8_t servo_id,
+                           const std::string& gripper_type,
+                           double& out_mm);
+
   std::optional<std::vector<uint8_t>> read_data(uint8_t servo_id, uint8_t address, uint8_t length);
   std::pair<std::vector<uint8_t>, uint8_t> write_data(uint8_t servo_id, uint8_t address, const std::vector<uint8_t>& values);
   std::pair<std::vector<uint8_t>, uint8_t> reg_write(uint8_t servo_id, uint8_t address, const std::vector<uint8_t>& values);

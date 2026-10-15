@@ -5,8 +5,8 @@
 #include <ostream>
 #include <unordered_map>
 #include <vector>
-#include "a10_init_presets.hpp"
 #include "a10_tcp_server.hpp"
+#include "a10_init_presets.hpp"
 #include "gripper.hpp"
 
 extern A10TcpServer *g_tcp_server;
@@ -350,10 +350,6 @@ namespace robot
 		(void)tolerance;
 
         GravComp gc;
-
-        // static double init_pos[12] =
-        // { 0, 0, 5 * PI / 6, -5 * PI / 6, -PI / 2, 0,
-        // 0, 0, -2 * PI / 3, PI / 6, PI / 2, 0 };
 
         auto getForceData = [&](double* data_, int m_, bool init_)
 		{

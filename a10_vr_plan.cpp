@@ -31,6 +31,7 @@ void request_vr_teleop_stop()
     if (g_tcp_server != nullptr)
     {
         g_tcp_server->clear_ee_delta_target_nrt();
+        g_tcp_server->clear_ee_anchor_target_nrt();
     }
 }
 
@@ -38,9 +39,11 @@ void request_vr_init()
 {
     g_a10_vr_init_requested.store(true, std::memory_order_release);
     clear_vr_grip_cmd();
+    request_gripper_position_mm(k_gripper_mm_min);
     if (g_tcp_server != nullptr)
     {
         g_tcp_server->clear_ee_delta_target_nrt();
+        g_tcp_server->clear_ee_anchor_target_nrt();
     }
 }
 
@@ -506,6 +509,8 @@ KAANH_DEFINE_BIG_FOUR_CPP(A10VrCliInit)
 
 ARIS_REGISTRATION
 {
+    aris::core::class_<a10_tcp::A10VrResetModule>("A10VrResetModule")
+        .inherit<kaanh::module::MiddleModule>();
     aris::core::class_<a10_tcp::A10VrDriver>("A10VrDriver").inherit<aris::plan::Plan>();
     aris::core::class_<a10_tcp::A10VrCliStop>("A10VrCliStop").inherit<aris::plan::Plan>();
     aris::core::class_<a10_tcp::A10VrCliInit>("A10VrCliInit").inherit<aris::plan::Plan>();

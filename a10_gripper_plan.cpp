@@ -98,10 +98,22 @@ KAANH_DEFINE_BIG_FOUR_CPP(A10GripperMove)
 auto A10GripperStatus::prepareNrt() -> void
 {
     skip_rt(*this);
-    mout() << "g_status: usb=" << (g_gripper ? "connected" : "not connected")
-           << " target_mm=" << g_vr_grip_target_mm.load(std::memory_order_acquire)
-           << " actual_mm=" << g_vr_grip_actual_mm.load(std::memory_order_acquire)
-           << " vr_cmd=" << g_vr_grip_cmd.load(std::memory_order_acquire) << std::endl;
+    // 注意：usb= 只反映“启动时”的连接结果；运行时真实状态看 service=。
+    mout() << "g_status: usb=" << (g_gripper ? "connected" : "not connected") << std::endl;
+    mout() << "g_status: " << gripper_health_report() << std::endl;
+    if (g_gripper != nullptr)
+    {
+        double mm = 0.0;
+        if (g_gripper->try_get_position_mm(k_gripper_servo_id, k_gripper_type, mm))
+        {
+            mout() << "g_status: live_read_ok=yes position_mm=" << mm << std::endl;
+        }
+        else
+        {
+            mout() << "g_status: live_read_ok=NO (串口无响应，target/actual 已不可信)"
+                   << std::endl;
+        }
+    }
 }
 
 auto A10GripperStatus::executeRT() -> int { return 0; }

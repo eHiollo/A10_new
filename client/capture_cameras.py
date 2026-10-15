@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--rotate-180-sources",
         nargs="*",
         default=["0"],
-        help="保存前旋转 180° 的端口列表（数字或与 /dev/video 后缀一致），默认仅 0（顶视倒装）。传空列表可关闭: --rotate-180-sources",
+        help="保存前旋转 180° 的端口列表（数字或与 /dev/video 后缀一致），默认仅 0（公司实机右腕相机倒装）。传空列表可关闭: --rotate-180-sources",
     )
     return parser
 

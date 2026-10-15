@@ -3,16 +3,24 @@
 #include "kaanh/general/macro.hpp"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <string>
 #include <vector>
 
+#include <aris/core/log.hpp>
 #include <rtb.hpp>
 
 #include "a10_gripper_bridge.hpp"
 #include "a10_init_presets.hpp"
 #include "a10_policy_tcp_plan.hpp"
 #include "a10_tcp_server.hpp"
+#include "a10_vr_joint_diagnostics.hpp"
+#include "a10_vr_joint_guard.hpp"
 #include "a10_vr_plan.hpp"
 
 extern A10TcpServer* g_tcp_server;
@@ -29,6 +37,32 @@ constexpr double k_trans_dz = 0.001;
 constexpr double k_rot_dz_rad = 0.2 * k_deg2rad;
 constexpr double k_max_trans_step = 0.03;
 constexpr double k_max_rot_step_rad = 1.8 * k_deg2rad;
+// Diagnostic thresholds mirror MotorConfig in kaanh.xml. Anchor-mode joint
+// protection uses VrJointGuard independently of the diagnostic logging switch.
+constexpr std::array<double, k_joint_num> k_joint_max_velocity_rad_s = {
+    2.6179938779914944,
+    2.6179938779914944,
+    2.6179938779914944,
+    3.1415926535897931,
+    3.1415926535897931,
+    3.1415926535897931,
+};
+constexpr std::array<double, k_joint_num> k_joint_max_acceleration_rad_s2 = {
+    17.453292519943293,
+    17.453292519943293,
+    17.453292519943293,
+    17.453292519943293,
+    17.453292519943293,
+    17.453292519943293,
+};
+constexpr std::array<double, k_joint_num> k_joint_max_following_error_rad = {
+    0.5235987755982988,
+    0.5235987755982988,
+    0.5235987755982988,
+    0.5235987755982988,
+    0.5235987755982988,
+    0.5235987755982988,
+};
 
 auto arm_model(aris::plan::Plan& p) -> aris::dynamic::Model&
 {
@@ -43,10 +77,8 @@ auto ee_motion(aris::plan::Plan& p) -> aris::dynamic::GeneralMotion&
 
 double wrap_near(double ref, double raw)
 {
-    double d = raw - ref;
-    while (d > M_PI) d -= 2.0 * M_PI;
-    while (d < -M_PI) d += 2.0 * M_PI;
-    return ref + d;
+    // remainder also terminates for non-finite IK output; the guard rejects it.
+    return ref + std::remainder(raw - ref, 2.0 * M_PI);
 }
 
 double vec3_norm(const double* v)
@@ -77,8 +109,7 @@ void slew_vec3(double* v, const double* v_target, double max_dv)
 {
     for (int i = 0; i < 3; ++i)
     {
-        const double dv = std::clamp(v_target[i] - v[i], -max_dv, max_dv);
-        v[i] += dv;
+        v[i] = slew_toward(v[i], v_target[i], max_dv);
     }
 }
 
@@ -323,24 +354,205 @@ struct A10VrVelDriver::Imp
     double current_joints[k_joint_num]{};
     double ik_joints[k_joint_num]{};
     double output_joints[k_joint_num]{};
+    double previous_joint_command_velocity[k_joint_num]{};
+    double previous_actual_joints[k_joint_num]{};
+    bool joint_diag_active[k_joint_num]{};
+    std::uint32_t joint_diag_last_flags[k_joint_num]{};
+    std::int64_t previous_actual_count_{0};
+    bool joint_diag_history_initialized_{false};
+    bool joint_diag_enabled_{false};
+    VrJointGuard joint_guard_;
+    VrJointGuard::Result joint_guard_result_;
+    double raw_ik_joints[k_joint_num]{};
+    unsigned settled_cycles_{0};
+    bool reseed_ik_from_actual_{false};
+    EeAnchorCommand trace_packet_;
+    std::uint64_t trace_control_ns_{0}, trace_previous_control_ns_{0}, trace_dt_ns_{0};
+    std::uint64_t trace_consume_ns_{0}, trace_mailbox_seq_{0}, trace_skipped_{0};
+    bool trace_packet_updated_{false};
+    const char* trace_packet_result_{"none"};
+    double trace_requested_v_[3]{}, trace_requested_w_[3]{};
+    double trace_slewed_v_[3]{}, trace_slewed_w_[3]{};
 
     std::uint64_t consumed_ee_delta_seq_{0};
+    std::uint64_t consumed_ee_anchor_seq_{0};
+    EeAnchorShadow anchor_shadow_;
+    EeAnchorReferenceGovernor anchor_governor_;
     std::int64_t last_packet_count_{0};
-    std::int64_t homing_start_count_{0};
+    std::int64_t last_anchor_packet_count_{0};
     bool inited_{false};
     bool idle_coast_{false};
     bool homing_{false};
     int homing_preset_{0};
+    std::int64_t homing_start_count_{0};
+    bool anchor_control_enabled_{true};
+    bool anchor_fault_latched_{false};
+    std::string anchor_fault_session_;
+    std::uint64_t anchor_fault_id_{0};
+    std::string anchor_fault_reason_;
+    std::uint32_t anchor_ik_fail_cycles_{0};
+    std::uint32_t max_anchor_ik_fail_cycles_{5};
 
     double max_lin_vel_{0.12};
-    double max_ang_vel_{0.4};
-    double max_lin_acc_{0.8};
-    double max_ang_acc_{1.5};
+    double max_ang_vel_{0.32};
+    double max_lin_acc_{0.4};
+    double max_ang_acc_{0.96};
     double target_pull_{0.995};
-    double kp_pos_{3.0};
-    double kp_rot_{2.0};
+    double kp_pos_{6.0};
+    double kp_rot_{4.8};
     double rot_gain_{1.0};
     double timeout_s_{0.12};
+    double anchor_timeout_s_{0.25};
+    double anchor_ref_max_lin_vel_{0.12};
+    double anchor_ref_max_ang_vel_{0.32};
+
+    void reset_joint_diagnostics()
+    {
+        std::fill_n(previous_joint_command_velocity, k_joint_num, 0.0);
+        std::fill_n(previous_actual_joints, k_joint_num, 0.0);
+        std::fill_n(joint_diag_active, k_joint_num, false);
+        std::fill_n(joint_diag_last_flags, k_joint_num, joint_diag_none);
+        previous_actual_count_ = 0;
+        joint_diag_history_initialized_ = false;
+    }
+
+    void write_joint_trace_header(aris::plan::Plan& plan)
+    {
+        plan.lout()
+            << "VR_JOINT_TRACE_HEADER,count,ik_ok,anchor_control,anchor_active,anchor_state,"
+               "anchor_id,sample_sequence,track_pos,track_rot,fault,session_id,actual_dt,"
+               "v_cmd_x,v_cmd_y,v_cmd_z,w_cmd_x,w_cmd_y,w_cmd_z,"
+               "reference_x,reference_y,reference_z,user_target_x,user_target_y,user_target_z";
+        for (int joint = 0; joint < k_joint_num; ++joint)
+        {
+            const int number = joint + 1;
+            plan.lout() << ",j" << number << "_q_prev"
+                        << ",j" << number << "_q_next"
+                        << ",j" << number << "_dq"
+                        << ",j" << number << "_qdot_cmd"
+                        << ",j" << number << "_qddot_cmd"
+                        << ",j" << number << "_q_actual"
+                        << ",j" << number << "_q_actual_prev"
+                        << ",j" << number << "_qdot_actual"
+                        << ",j" << number << "_follow_error"
+                        << ",j" << number << "_flags";
+        }
+        plan.lout()
+            << ","
+               "actual_r00,actual_r01,actual_r02,actual_x,actual_r10,actual_r11,"
+               "actual_r12,actual_y,actual_r20,actual_r21,actual_r22,actual_z,"
+               "command_r00,command_r01,command_r02,command_x,command_r10,"
+               "command_r11,command_r12,command_y,command_r20,command_r21,"
+               "command_r22,command_z,joint_guard_limited,joint_guard_scale,"
+               "joint_guard_fault,joint_guard_joint";
+        for (int i = 1; i <= k_joint_num; ++i) plan.lout() << ",j" << i << "_q_ik_raw";
+        plan.lout() << ",trace_version,control_time_ns,control_dt_ns,packet_updated,packet_result,"
+                       "mailbox_seq,mailbox_skipped,packet_consume_time_ns,robot_receive_time_ns,"
+                       "robot_publish_time_ns,client_sample_time_valid,client_sample_time_ns,"
+                       "client_send_time_valid,client_send_time_ns,rx_anchor_id,rx_sample_sequence,rx_active,"
+                       "rx_offset_x,rx_offset_y,rx_offset_z,rx_offset_rx,rx_offset_ry,rx_offset_rz";
+        for (const char* prefix : {"reference", "user_target", "robot_anchor"})
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c) plan.lout() << "," << prefix << "_r" << r << c;
+        plan.lout() << ",robot_anchor_x,robot_anchor_y,robot_anchor_z,"
+                       "requested_v_x,requested_v_y,requested_v_z,requested_w_x,requested_w_y,requested_w_z,"
+                       "slewed_v_x,slewed_v_y,slewed_v_z,slewed_w_x,slewed_w_y,slewed_w_z,"
+                       "kp,kp_rot,vmax,wmax,ref_vmax,ref_wmax,amax,jacc,joint_amax";
+        for (int i = 1; i <= k_joint_num; ++i)
+            plan.lout() << ",j" << i << "_min_pos,j" << i << "_max_pos,j" << i << "_max_speed";
+        plan.lout() << "\n";
+    }
+
+    void log_joint_trace(
+        aris::plan::Plan& plan,
+        std::int64_t control_count,
+        bool ik_ok,
+        const std::array<JointDiagnosticResult, k_joint_num>& results,
+        const double actual_pm[16])
+    {
+        const char* state = anchor_control_state_name(anchor_governor_.state());
+        const char* fault = anchor_fault_reason_.empty() ? "none" : anchor_fault_reason_.c_str();
+        const std::uint64_t anchor_id = anchor_shadow_.active() ? anchor_shadow_.anchor_id() : 0;
+        const std::uint64_t sample_sequence =
+            anchor_shadow_.active() ? anchor_shadow_.sample_sequence() : 0;
+        const auto& reference = anchor_governor_.reference_pm();
+        const auto& user_target = anchor_shadow_.user_target_pm();
+
+        plan.lout() << std::setprecision(10)
+                    << "VR_JOINT_TRACE," << control_count << "," << (ik_ok ? 1 : 0)
+                    << "," << (anchor_control_enabled_ ? 1 : 0)
+                    << "," << (anchor_shadow_.active() ? 1 : 0)
+                    << "," << state << "," << anchor_id << "," << sample_sequence
+                    << "," << anchor_governor_.tracking_error_m()
+                    << "," << anchor_governor_.tracking_error_rad()
+                    << "," << fault << "," << anchor_shadow_.session_id()
+                    << "," << (control_count - previous_actual_count_) * k_dt
+                    << "," << v_cmd_tool[0] << "," << v_cmd_tool[1] << "," << v_cmd_tool[2]
+                    << "," << w_cmd_tool[0] << "," << w_cmd_tool[1] << "," << w_cmd_tool[2]
+                    << "," << reference[3] << "," << reference[7] << "," << reference[11]
+                    << "," << user_target[3] << "," << user_target[7] << "," << user_target[11];
+        for (int joint = 0; joint < k_joint_num; ++joint)
+        {
+            const auto& result = results[static_cast<std::size_t>(joint)];
+            plan.lout() << "," << output_joints[joint]
+                        << "," << ik_joints[joint]
+                        << "," << result.command_delta_rad
+                        << "," << result.command_velocity_rad_s
+                        << "," << result.command_acceleration_rad_s2
+                        << "," << current_joints[joint]
+                        << "," << previous_actual_joints[joint]
+                        << "," << result.actual_velocity_rad_s
+                        << "," << result.following_error_rad
+                        << "," << result.flags;
+        }
+        constexpr int k_pose_indices[12] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+        for (int index : k_pose_indices) plan.lout() << "," << actual_pm[index];
+        for (int index : k_pose_indices) plan.lout() << "," << command_pm[index];
+        plan.lout() << "," << joint_guard_result_.limited << "," << joint_guard_result_.scale
+                    << "," << joint_guard_result_.fault << "," << joint_guard_result_.joint;
+        for (double raw : raw_ik_joints) plan.lout() << "," << raw;
+        const auto& packet = trace_packet_;
+        plan.lout() << ",2," << trace_control_ns_ << "," << trace_dt_ns_
+                    << "," << trace_packet_updated_ << "," << trace_packet_result_
+                    << "," << trace_mailbox_seq_ << "," << trace_skipped_
+                    << "," << trace_consume_ns_ << "," << packet.robot_receive_time_ns
+                    << "," << packet.robot_publish_time_ns
+                    << "," << packet.has_client_sample_time << "," << packet.client_sample_time_ns
+                    << "," << packet.has_client_send_time << "," << packet.client_send_time_ns
+                    << "," << packet.anchor_id << "," << packet.sample_sequence << "," << packet.active;
+        for (double value : packet.offset) plan.lout() << "," << value;
+        const auto& robot_anchor = anchor_shadow_.robot_anchor_pm();
+        for (const auto* pm : {reference.data(), user_target.data(), robot_anchor.data()})
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c) plan.lout() << "," << pm[r * 4 + c];
+        for (int index : {3, 7, 11}) plan.lout() << "," << robot_anchor[index];
+        for (const auto* vec : {trace_requested_v_, trace_requested_w_, trace_slewed_v_, trace_slewed_w_})
+            for (int i = 0; i < 3; ++i) plan.lout() << "," << vec[i];
+        plan.lout() << "," << kp_pos_ << "," << kp_rot_ << "," << max_lin_vel_ << "," << max_ang_vel_
+                    << "," << anchor_ref_max_lin_vel_ << "," << anchor_ref_max_ang_vel_
+                    << "," << max_lin_acc_ << "," << max_ang_acc_ << "," << VrJointGuard::acceleration;
+        for (int i = 0; i < k_joint_num; ++i)
+            plan.lout() << "," << joint_guard_.minimum(i) << "," << joint_guard_.maximum(i)
+                        << "," << VrJointGuard::speed_limit(i);
+        plan.lout() << "\n";
+    }
+
+    void print_joint_diagnostic_summary(
+        aris::plan::Plan& plan, int joint, const JointDiagnosticResult& result)
+    {
+        plan.mout() << "vr_vel joint_diag: joint=" << (joint + 1)
+                    << " flags=" << result.flags
+                    << " q_prev=" << output_joints[joint]
+                    << " q_next=" << ik_joints[joint]
+                    << " qdot=" << result.command_velocity_rad_s
+                    << " qddot=" << result.command_acceleration_rad_s2
+                    << " q_actual=" << current_joints[joint]
+                    << " anchor_state=" << anchor_control_state_name(anchor_governor_.state())
+                    << " anchor=" << (anchor_shadow_.active() ? anchor_shadow_.anchor_id() : 0)
+                    << " sample="
+                    << (anchor_shadow_.active() ? anchor_shadow_.sample_sequence() : 0)
+                    << std::endl;
+    }
 
     void apply_joints_to_motors(aris::plan::Plan& plan)
     {
@@ -367,7 +579,7 @@ struct A10VrVelDriver::Imp
         w_cmd_tool[2] = 0.0;
     }
 
-    void drain_ee_delta()
+    void drain_teleop_mailboxes()
     {
         if (g_tcp_server == nullptr)
         {
@@ -379,6 +591,12 @@ struct A10VrVelDriver::Imp
         {
             consumed_ee_delta_seq_ = seq;
         }
+        EeAnchorCommand anchor;
+        std::uint64_t anchor_seq = 0;
+        if (g_tcp_server->fetch_ee_anchor_if_updated(anchor, anchor_seq, consumed_ee_anchor_seq_))
+        {
+            consumed_ee_anchor_seq_ = anchor_seq;
+        }
     }
 
     void begin_homing(int preset, std::int64_t now, aris::plan::Plan& plan)
@@ -387,9 +605,22 @@ struct A10VrVelDriver::Imp
         homing_preset_ = a10_init::clamp_preset(preset);
         homing_start_count_ = now;
         idle_coast_ = false;
+        reseed_ik_from_actual_ = false;
+        settled_cycles_ = 0;
         zero_motion_state();
         clear_vr_grip_cmd();
-        drain_ee_delta();
+        request_gripper_position_mm(k_gripper_mm_min);
+        drain_teleop_mailboxes();
+        anchor_shadow_.reset();
+        anchor_governor_.reset();
+        anchor_fault_latched_ = false;
+        anchor_fault_session_.clear();
+        anchor_fault_id_ = 0;
+        anchor_fault_reason_.clear();
+        anchor_ik_fail_cycles_ = 0;
+        joint_guard_.reset();
+        joint_guard_result_ = {};
+        std::fill_n(previous_joint_command_velocity, k_joint_num, 0.0);
         plan.mout() << "vr_vel: homing to preset=" << homing_preset_ << std::endl;
     }
 
@@ -420,7 +651,8 @@ struct A10VrVelDriver::Imp
         return arrived;
     }
 
-    void reacquire_from_command(aris::plan::Plan& plan, aris::dynamic::Model& arm, aris::dynamic::GeneralMotion& ee)
+    void reacquire_from_command(
+        aris::plan::Plan& plan, aris::dynamic::Model& arm, aris::dynamic::GeneralMotion& ee)
     {
         arm.setInputPos(output_joints);
         if (arm.forwardKinematics())
@@ -441,16 +673,92 @@ struct A10VrVelDriver::Imp
         ee.getMpm(target_pm);
         std::memcpy(command_pm, target_pm, sizeof(command_pm));
         std::memcpy(ik_joints, output_joints, sizeof(ik_joints));
+        std::memcpy(raw_ik_joints, output_joints, sizeof(raw_ik_joints));
         zero_motion_state();
         idle_coast_ = false;
         last_packet_count_ = plan.count();
+        last_anchor_packet_count_ = plan.count();
         if (g_tcp_server != nullptr)
         {
             consumed_ee_delta_seq_ = g_tcp_server->ee_delta_seq();
+            consumed_ee_anchor_seq_ = g_tcp_server->ee_anchor_seq();
         }
-        sync_vr_grip_target_from_actual(g_vr_grip_actual_mm.load(std::memory_order_acquire));
+        request_gripper_position_mm(k_gripper_mm_min);
+        std::fill_n(previous_joint_command_velocity, k_joint_num, 0.0);
+        settled_cycles_ = 0;
+        reseed_ik_from_actual_ = false;
         inited_ = true;
         homing_ = false;
+    }
+
+    void retarget_to_actual_for_smooth_stop(const double actual_pm[16])
+    {
+        std::memcpy(target_pm, actual_pm, sizeof(target_pm));
+        idle_coast_ = true;
+        anchor_ik_fail_cycles_ = 0;
+    }
+
+    void engage_anchor_control(const double actual_pm[16])
+    {
+        // Re-anchor only at rest. A hardware/large following-error fault needs a
+        // plan restart; a new network anchor must not resume a stale joint target.
+        if (joint_guard_.faulted()) return;
+        if (settled_cycles_ < 25)
+        {
+            enter_anchor_fault(actual_pm, "reanchor_not_settled",
+                               anchor_shadow_.session_id(), anchor_shadow_.anchor_id());
+            return;
+        }
+        anchor_fault_latched_ = false;
+        anchor_fault_session_.clear();
+        anchor_fault_id_ = 0;
+        anchor_fault_reason_.clear();
+        anchor_governor_.engage(actual_pm);
+        std::memcpy(target_pm, actual_pm, sizeof(target_pm));
+        std::memcpy(command_pm, actual_pm, sizeof(command_pm));
+        zero_motion_state();
+        reseed_ik_from_actual_ = true;
+        // output_joints and its velocity history are NOT snapped to feedback:
+        // the small synchronization correction still passes through the guard.
+        anchor_ik_fail_cycles_ = 0;
+        idle_coast_ = false;
+    }
+
+    void release_anchor_control(const double actual_pm[16])
+    {
+        if (joint_guard_.faulted()) return;
+        anchor_fault_latched_ = false;
+        anchor_fault_session_.clear();
+        anchor_fault_id_ = 0;
+        anchor_fault_reason_.clear();
+        anchor_governor_.release(actual_pm);
+        retarget_to_actual_for_smooth_stop(actual_pm);
+    }
+
+    bool enter_anchor_fault(
+        const double actual_pm[16],
+        const std::string& reason,
+        const std::string& session_id,
+        std::uint64_t anchor_id)
+    {
+        const bool newly_latched =
+            !anchor_fault_latched_ || anchor_fault_session_ != session_id
+            || anchor_fault_id_ != anchor_id || anchor_fault_reason_ != reason;
+        anchor_fault_latched_ = true;
+        anchor_fault_session_ = session_id;
+        anchor_fault_id_ = anchor_id;
+        anchor_fault_reason_ = reason;
+        anchor_governor_.force_fault(actual_pm);
+        retarget_to_actual_for_smooth_stop(actual_pm);
+        return newly_latched;
+    }
+
+    bool anchor_command_blocked_by_fault(const EeAnchorCommand& command) const
+    {
+        if (joint_guard_.faulted()) return true;
+        return anchor_fault_latched_ && command.active
+            && command.session_id == anchor_fault_session_
+            && command.anchor_id <= anchor_fault_id_;
     }
 };
 
@@ -462,7 +770,36 @@ auto A10VrVelDriver::prepareNrt() -> void
     imp_->homing_preset_ = 0;
     imp_->homing_start_count_ = 0;
     imp_->consumed_ee_delta_seq_ = 0;
+    imp_->consumed_ee_anchor_seq_ = 0;
+    imp_->anchor_shadow_.reset();
+    imp_->anchor_governor_.reset();
     imp_->last_packet_count_ = 0;
+    imp_->last_anchor_packet_count_ = 0;
+    imp_->anchor_fault_latched_ = false;
+    imp_->anchor_fault_session_.clear();
+    imp_->anchor_fault_id_ = 0;
+    imp_->anchor_fault_reason_.clear();
+    imp_->anchor_ik_fail_cycles_ = 0;
+    imp_->reset_joint_diagnostics();
+    imp_->joint_guard_.reset();
+    imp_->joint_guard_result_ = {};
+    imp_->settled_cycles_ = 0;
+    imp_->reseed_ik_from_actual_ = false;
+    imp_->trace_packet_ = {};
+    imp_->trace_control_ns_ = imp_->trace_previous_control_ns_ = imp_->trace_dt_ns_ = 0;
+    imp_->trace_consume_ns_ = imp_->trace_mailbox_seq_ = imp_->trace_skipped_ = 0;
+    imp_->trace_packet_updated_ = false;
+    imp_->trace_packet_result_ = "none";
+    for (auto* vec : {imp_->trace_requested_v_, imp_->trace_requested_w_,
+                      imp_->trace_slewed_v_, imp_->trace_slewed_w_}) std::fill_n(vec, 3, 0.0);
+    imp_->joint_diag_enabled_ = doubleParam("joint_diag") >= 0.5;
+    if (imp_->joint_diag_enabled_)
+    {
+        const std::string log_name = std::string("vr_joint_trace_")
+            + aris::core::logFileTimeFormat(std::chrono::system_clock::now());
+        master()->logFileRawName(log_name.c_str());
+        std::cout << "vr_vel joint trace log: " << log_name << std::endl;
+    }
     imp_->zero_motion_state();
     g_a10_vr_stop_requested.store(false, std::memory_order_release);
     g_a10_vr_init_requested.store(false, std::memory_order_release);
@@ -476,6 +813,13 @@ auto A10VrVelDriver::prepareNrt() -> void
 
 auto A10VrVelDriver::executeRT() -> int
 {
+    imp_->trace_control_ns_ = anchor_monotonic_time_ns();
+    imp_->trace_dt_ns_ = imp_->trace_previous_control_ns_
+        ? imp_->trace_control_ns_ - imp_->trace_previous_control_ns_ : 0;
+    imp_->trace_previous_control_ns_ = imp_->trace_control_ns_;
+    imp_->trace_packet_updated_ = false;
+    imp_->trace_packet_result_ = "none";
+    imp_->trace_skipped_ = 0;
     if (g_a10_policy_tcp_stop_requested.exchange(false, std::memory_order_acq_rel))
     {
         g_a10_vr_stop_requested.store(false, std::memory_order_release);
@@ -514,16 +858,23 @@ auto A10VrVelDriver::executeRT() -> int
         }
         return 0;
     }
-    for (int i = 0; i < k_joint_num; ++i)
-    {
-        imp_->current_joints[i] = motors[k_motor_base + i].actualPos();
-    }
-
     auto& arm = arm_model(*this);
     auto& ee = ee_motion(*this);
 
     if (count() == 1)
     {
+        VrJointGuard::Joints minimum{}, maximum{};
+        for (int i = 0; i < k_joint_num; ++i)
+        {
+            minimum[i] = motors[k_motor_base + i].minPos();
+            maximum[i] = motors[k_motor_base + i].maxPos();
+        }
+        if (!imp_->joint_guard_.set_position_limits(minimum, maximum))
+        {
+            clear_vr_grip_cmd();
+            mout() << "vr_vel: invalid MotorConfig position limits; abort" << std::endl;
+            return -1;
+        }
         if (doubleParam("vmax") > 1e-9) imp_->max_lin_vel_ = doubleParam("vmax");
         if (doubleParam("wmax") > 1e-9) imp_->max_ang_vel_ = doubleParam("wmax");
         if (doubleParam("amax") > 1e-9) imp_->max_lin_acc_ = doubleParam("amax");
@@ -536,9 +887,67 @@ auto A10VrVelDriver::executeRT() -> int
         if (doubleParam("kp_rot") >= 0.0) imp_->kp_rot_ = doubleParam("kp_rot");
         if (doubleParam("rot_gain") > 1e-9) imp_->rot_gain_ = doubleParam("rot_gain");
         if (doubleParam("timeout") > 1e-9) imp_->timeout_s_ = doubleParam("timeout");
+        imp_->anchor_control_enabled_ = doubleParam("anchor_control") >= 0.5;
+        if (doubleParam("anchor_timeout") > 1e-9)
+        {
+            imp_->anchor_timeout_s_ = doubleParam("anchor_timeout");
+        }
+        if (doubleParam("ik_fault_cycles") >= 1.0)
+        {
+            imp_->max_anchor_ik_fail_cycles_ = static_cast<std::uint32_t>(
+                std::max(1.0, std::round(doubleParam("ik_fault_cycles"))));
+        }
+        AnchorGovernorConfig governor_config;
+        if (doubleParam("ref_vmax") > 1e-9)
+        {
+            governor_config.max_reference_linear_speed_m_s = doubleParam("ref_vmax");
+        }
+        if (doubleParam("ref_wmax") > 1e-9)
+        {
+            governor_config.max_reference_angular_speed_rad_s = doubleParam("ref_wmax");
+        }
+        if (doubleParam("track_pos") > 1e-9)
+        {
+            governor_config.max_tracking_error_m = doubleParam("track_pos");
+        }
+        if (doubleParam("track_rot") > 1e-9)
+        {
+            governor_config.max_tracking_error_rad = doubleParam("track_rot");
+        }
+        if (doubleParam("track_fault_cycles") >= 1.0)
+        {
+            governor_config.fault_after_frozen_cycles = static_cast<std::uint32_t>(
+                std::max(1.0, std::round(doubleParam("track_fault_cycles"))));
+        }
+        imp_->anchor_ref_max_lin_vel_ = governor_config.max_reference_linear_speed_m_s;
+        imp_->anchor_ref_max_ang_vel_ = governor_config.max_reference_angular_speed_rad_s;
+        imp_->anchor_governor_.set_config(governor_config);
         if (doubleParam("grip_vel") > 1e-9)
         {
             g_vr_grip_vel_mm_s.store(doubleParam("grip_vel"), std::memory_order_release);
+        }
+        mout() << "vr_vel: kp=" << imp_->kp_pos_ << " kp_rot=" << imp_->kp_rot_
+               << " vmax=" << imp_->max_lin_vel_ << " wmax=" << imp_->max_ang_vel_
+               << " ref_vmax=" << imp_->anchor_ref_max_lin_vel_
+               << " ref_wmax=" << imp_->anchor_ref_max_ang_vel_
+               << " amax=" << imp_->max_lin_acc_ << " jacc=" << imp_->max_ang_acc_
+               << std::endl;
+        if (imp_->joint_diag_enabled_) imp_->write_joint_trace_header(*this);
+    }
+
+    for (int i = 0; i < k_joint_num; ++i)
+    {
+        imp_->current_joints[i] = motors[k_motor_base + i].actualPos();
+        if (!std::isfinite(imp_->current_joints[i])
+            || (imp_->anchor_control_enabled_
+                && !imp_->homing_
+                && !g_a10_vr_init_requested.load(std::memory_order_acquire)
+                && (imp_->current_joints[i] < imp_->joint_guard_.minimum(i)
+                    || imp_->current_joints[i] > imp_->joint_guard_.maximum(i))))
+        {
+            clear_vr_grip_cmd();
+            mout() << "vr_vel: invalid/out-of-range joint feedback; abort, joint=" << i + 1 << std::endl;
+            return -1;
         }
     }
 
@@ -550,7 +959,9 @@ auto A10VrVelDriver::executeRT() -> int
         arm.setInputPos(imp_->current_joints);
         if (arm.forwardKinematics())
         {
-            return count();
+            clear_vr_grip_cmd();
+            mout() << "vr_vel: actual FK failed; abort" << std::endl;
+            return -1;
         }
         ee.updP();
         ee.getMpm(T_base_to_ee);
@@ -562,11 +973,26 @@ auto A10VrVelDriver::executeRT() -> int
         std::memcpy(imp_->command_pm, T_base_to_ee, sizeof(imp_->command_pm));
         std::memcpy(imp_->output_joints, imp_->current_joints, sizeof(imp_->output_joints));
         std::memcpy(imp_->ik_joints, imp_->current_joints, sizeof(imp_->ik_joints));
+        std::memcpy(imp_->raw_ik_joints, imp_->current_joints, sizeof(imp_->raw_ik_joints));
+        std::memcpy(
+            imp_->previous_actual_joints,
+            imp_->current_joints,
+            sizeof(imp_->previous_actual_joints));
+        std::fill_n(imp_->previous_joint_command_velocity, k_joint_num, 0.0);
+        imp_->joint_diag_history_initialized_ = true;
+        imp_->previous_actual_count_ = count();
+        imp_->anchor_governor_.release(T_base_to_ee);
         imp_->zero_motion_state();
         imp_->last_packet_count_ = count();
+        imp_->last_anchor_packet_count_ = count();
         sync_vr_grip_target_from_actual(g_vr_grip_actual_mm.load(std::memory_order_acquire));
         imp_->inited_ = true;
-        mout() << "vr_vel: init ok (P velocity, target+=delta, tool-frame)" << std::endl;
+        if (imp_->joint_diag_enabled_)
+        {
+            const std::array<JointDiagnosticResult, k_joint_num> initial_results{};
+            imp_->log_joint_trace(*this, count(), true, initial_results, T_base_to_ee);
+        }
+        mout() << "vr_vel: init ok" << std::endl;
         if (!g_a10_vr_init_requested.load(std::memory_order_acquire))
         {
             return 1;
@@ -580,7 +1006,7 @@ auto A10VrVelDriver::executeRT() -> int
 
     if (imp_->homing_)
     {
-        imp_->drain_ee_delta();
+        imp_->drain_teleop_mailboxes();
         clear_vr_grip_cmd();
         const bool arrived = imp_->step_joints_toward_preset();
         const bool timed_out =
@@ -597,14 +1023,102 @@ auto A10VrVelDriver::executeRT() -> int
             }
             imp_->reacquire_from_command(*this, arm, ee);
         }
-        else if (count() % 1000 == 0)
-        {
-            mout() << "vr_vel homing: q=" << imp_->output_joints[0] << "\t" << imp_->output_joints[1]
-                   << "\t" << imp_->output_joints[2] << "\t" << imp_->output_joints[3] << "\t"
-                   << imp_->output_joints[4] << "\t" << imp_->output_joints[5] << std::endl;
-        }
+        std::memcpy(
+            imp_->previous_actual_joints,
+            imp_->current_joints,
+            sizeof(imp_->previous_actual_joints));
+        imp_->previous_actual_count_ = count();
         imp_->apply_joints_to_motors(*this);
         return count();
+    }
+
+    if (imp_->anchor_control_enabled_)
+    {
+        VrJointGuard::Joints previous{}, velocity{}, actual{}, actual_velocity{};
+        const double actual_dt = (count() - imp_->previous_actual_count_) * k_dt;
+        for (int i = 0; i < k_joint_num; ++i)
+        {
+            previous[i] = imp_->output_joints[i];
+            velocity[i] = imp_->previous_joint_command_velocity[i];
+            actual[i] = imp_->current_joints[i];
+            actual_velocity[i] = (actual[i] - imp_->previous_actual_joints[i]) / actual_dt;
+        }
+        imp_->settled_cycles_ = VrJointGuard::ready_to_anchor(
+            previous, velocity, actual, actual_velocity)
+            ? std::min(25U, imp_->settled_cycles_ + 1) : 0;
+    }
+
+    EeAnchorCommand anchor_command;
+    std::uint64_t anchor_mailbox_seq = 0;
+    if (g_tcp_server->fetch_ee_anchor_if_updated(
+            anchor_command, anchor_mailbox_seq, imp_->consumed_ee_anchor_seq_))
+    {
+        imp_->trace_packet_ = anchor_command;
+        imp_->trace_packet_updated_ = true;
+        imp_->trace_consume_ns_ = anchor_monotonic_time_ns();
+        imp_->trace_mailbox_seq_ = anchor_mailbox_seq;
+        imp_->trace_skipped_ = imp_->consumed_ee_anchor_seq_ && anchor_mailbox_seq > imp_->consumed_ee_anchor_seq_
+            ? anchor_mailbox_seq - imp_->consumed_ee_anchor_seq_ - 1 : 0;
+        imp_->trace_packet_result_ = "blocked";
+        imp_->consumed_ee_anchor_seq_ = anchor_mailbox_seq;
+        AnchorShadowUpdate update = AnchorShadowUpdate::duplicate;
+        bool update_applied = false;
+        if (!imp_->anchor_control_enabled_)
+        {
+            update = imp_->anchor_shadow_.update(anchor_command, T_base_to_ee);
+            update_applied = true;
+        }
+        else if (!anchor_command.active)
+        {
+            update = imp_->anchor_shadow_.update(anchor_command, T_base_to_ee);
+            update_applied = true;
+            imp_->last_anchor_packet_count_ = count();
+            imp_->release_anchor_control(T_base_to_ee);
+        }
+        else if (!imp_->anchor_command_blocked_by_fault(anchor_command))
+        {
+            if (imp_->anchor_fault_latched_)
+            {
+                imp_->anchor_fault_latched_ = false;
+                imp_->anchor_fault_reason_.clear();
+            }
+            update = imp_->anchor_shadow_.update(anchor_command, T_base_to_ee);
+            update_applied = true;
+            imp_->last_anchor_packet_count_ = count();
+            if (update == AnchorShadowUpdate::anchored)
+            {
+                imp_->engage_anchor_control(T_base_to_ee);
+            }
+            else if (update == AnchorShadowUpdate::stale)
+            {
+                if (imp_->enter_anchor_fault(
+                        T_base_to_ee,
+                        "stale_sequence",
+                        imp_->anchor_shadow_.session_id(),
+                        imp_->anchor_shadow_.anchor_id()))
+                {
+                    mout() << "vr_vel A2.3 fault: stale sequence; release/re-anchor required"
+                           << std::endl;
+                }
+            }
+        }
+        if (update_applied)
+        {
+            switch (update)
+            {
+            case AnchorShadowUpdate::inactive: imp_->trace_packet_result_ = "inactive"; break;
+            case AnchorShadowUpdate::anchored: imp_->trace_packet_result_ = "anchored"; break;
+            case AnchorShadowUpdate::updated: imp_->trace_packet_result_ = "updated"; break;
+            case AnchorShadowUpdate::duplicate: imp_->trace_packet_result_ = "duplicate"; break;
+            case AnchorShadowUpdate::stale: imp_->trace_packet_result_ = "stale"; break;
+            }
+        }
+        if (update == AnchorShadowUpdate::anchored
+            && imp_->anchor_fault_reason_ == "reanchor_not_settled")
+        {
+            mout() << "vr_vel: anchor rejected while settling; release and re-anchor after stop"
+                   << std::endl;
+        }
     }
 
     const double elapsed_since_packet =
@@ -620,22 +1134,87 @@ auto A10VrVelDriver::executeRT() -> int
         {
             set_vr_grip_cmd(delta[6]);
         }
-        if (is_effective_motion_delta(delta, imp_->rot_gain_))
+        if (!imp_->anchor_control_enabled_ && is_effective_motion_delta(delta, imp_->rot_gain_))
         {
             imp_->idle_coast_ = false;
             apply_vr_delta_to_target(imp_->target_pm, delta, imp_->rot_gain_);
         }
-        else
+        else if (!imp_->anchor_control_enabled_)
         {
             imp_->idle_coast_ = true;
         }
     }
-    else if (elapsed_since_packet > imp_->timeout_s_)
+    else if (!imp_->anchor_control_enabled_ && elapsed_since_packet > imp_->timeout_s_)
     {
         imp_->idle_coast_ = true;
     }
 
-    if (imp_->idle_coast_)
+    // 夹爪速度指令超时保护：g_vr_grip_cmd 是“速度”，服务线程会持续按 k_dt 积分它。
+    // 不清零的话，链路断开后它会按最后一个值把夹爪一直推到行程末端（顶死/夹手）。
+    // 与 anchor 模式无关，单独处理。
+    if (elapsed_since_packet > imp_->timeout_s_)
+    {
+        clear_vr_grip_cmd();
+    }
+
+    if (imp_->anchor_control_enabled_)
+    {
+        const double anchor_age_s =
+            static_cast<double>(count() - imp_->last_anchor_packet_count_) * k_dt;
+        if (imp_->anchor_governor_.control_active() && anchor_age_s > imp_->anchor_timeout_s_)
+        {
+            if (imp_->enter_anchor_fault(
+                    T_base_to_ee,
+                    "anchor_timeout",
+                    imp_->anchor_shadow_.session_id(),
+                    imp_->anchor_shadow_.anchor_id()))
+            {
+                mout() << "vr_vel A2.3 fault: anchor timeout; release/re-anchor required"
+                       << std::endl;
+            }
+        }
+
+        if (imp_->anchor_governor_.control_active() && imp_->anchor_shadow_.active())
+        {
+            // Pause reference advance while the joint envelope is binding.
+            const AnchorControlState state = imp_->anchor_governor_.step(
+                imp_->anchor_shadow_.user_target_pm().data(), T_base_to_ee, k_dt,
+                imp_->joint_guard_result_.limited);
+            if (state == AnchorControlState::fault)
+            {
+                if (imp_->enter_anchor_fault(
+                        T_base_to_ee,
+                        "tracking_error",
+                        imp_->anchor_shadow_.session_id(),
+                        imp_->anchor_shadow_.anchor_id()))
+                {
+                    mout() << "vr_vel A2.3 fault: tracking error persisted; re-anchor required"
+                           << std::endl;
+                }
+            }
+            else
+            {
+                std::memcpy(
+                    imp_->target_pm,
+                    imp_->anchor_governor_.reference_pm().data(),
+                    sizeof(imp_->target_pm));
+                imp_->idle_coast_ = false;
+            }
+        }
+        else
+        {
+            if (imp_->anchor_governor_.state() == AnchorControlState::fault)
+            {
+                imp_->anchor_governor_.force_fault(T_base_to_ee);
+            }
+            else
+            {
+                imp_->anchor_governor_.release(T_base_to_ee);
+            }
+            imp_->retarget_to_actual_for_smooth_stop(T_base_to_ee);
+        }
+    }
+    else if (imp_->idle_coast_)
     {
         const double alpha = 1.0 - imp_->target_pull_;
         pull_target_toward_actual(imp_->target_pm, T_base_to_ee, alpha);
@@ -645,48 +1224,194 @@ auto A10VrVelDriver::executeRT() -> int
     double e_rot_tool[3]{};
     pose_error_tool(imp_->target_pm, T_base_to_ee, e_pos_tool, e_rot_tool);
 
-    double v_target_tool[3] = {
-        imp_->kp_pos_ * e_pos_tool[0],
-        imp_->kp_pos_ * e_pos_tool[1],
-        imp_->kp_pos_ * e_pos_tool[2],
-    };
-    double w_target_tool[3] = {
-        imp_->kp_rot_ * e_rot_tool[0],
-        imp_->kp_rot_ * e_rot_tool[1],
-        imp_->kp_rot_ * e_rot_tool[2],
-    };
-    clamp_vec3(v_target_tool, imp_->max_lin_vel_);
-    clamp_vec3(w_target_tool, imp_->max_ang_vel_);
+    double v_target_tool[3]{};
+    double w_target_tool[3]{};
+    // Release/fault must not snap command_pm to measured FK or clear velocity in one
+    // 2 ms cycle. A zero velocity target keeps command_pm continuous and reuses the
+    // validated amax/jacc slew path for controlled braking.
+    const bool anchor_smooth_stopping =
+        imp_->anchor_control_enabled_ && !imp_->anchor_governor_.control_active();
+    if (!anchor_smooth_stopping)
+    {
+        v_target_tool[0] = imp_->kp_pos_ * e_pos_tool[0];
+        v_target_tool[1] = imp_->kp_pos_ * e_pos_tool[1];
+        v_target_tool[2] = imp_->kp_pos_ * e_pos_tool[2];
+        w_target_tool[0] = imp_->kp_rot_ * e_rot_tool[0];
+        w_target_tool[1] = imp_->kp_rot_ * e_rot_tool[1];
+        w_target_tool[2] = imp_->kp_rot_ * e_rot_tool[2];
+    }
+
+    std::copy_n(v_target_tool, 3, imp_->trace_requested_v_);
+    std::copy_n(w_target_tool, 3, imp_->trace_requested_w_);
+    double linear_speed_limit = imp_->max_lin_vel_;
+    double angular_speed_limit = imp_->max_ang_vel_;
+    // In anchor mode ref_vmax/ref_wmax are also the final Cartesian envelope,
+    // not only the rate at which the reference governor advances.
+    if (imp_->anchor_control_enabled_)
+    {
+        linear_speed_limit = effective_anchor_speed_limit(
+            linear_speed_limit, imp_->anchor_ref_max_lin_vel_);
+        angular_speed_limit = effective_anchor_speed_limit(
+            angular_speed_limit, imp_->anchor_ref_max_ang_vel_);
+    }
+    clamp_vec3(v_target_tool, linear_speed_limit);
+    clamp_vec3(w_target_tool, angular_speed_limit);
 
     slew_vec3(imp_->v_cmd_tool, v_target_tool, imp_->max_lin_acc_ * k_dt);
     slew_vec3(imp_->w_cmd_tool, w_target_tool, imp_->max_ang_acc_ * k_dt);
+    std::copy_n(imp_->v_cmd_tool, 3, imp_->trace_slewed_v_);
+    std::copy_n(imp_->w_cmd_tool, 3, imp_->trace_slewed_w_);
 
+    double previous_command_pm[16];
+    std::memcpy(previous_command_pm, imp_->command_pm, sizeof(previous_command_pm));
     integrate_tool_twist(imp_->command_pm, imp_->v_cmd_tool, imp_->w_cmd_tool, k_dt);
 
-    if (count() % 250 == 0)
-    {
-        mout() << "vr_vel diag: |e_pos|=" << vec3_norm(e_pos_tool) << "m |e_rot|=" << vec3_norm(e_rot_tool)
-               << "rad |v|=" << vec3_norm(imp_->v_cmd_tool) << " |w|=" << vec3_norm(imp_->w_cmd_tool)
-               << (imp_->idle_coast_ ? " idle" : "") << std::endl;
-    }
-
-    arm.setInputPos(imp_->output_joints);
+    arm.setInputPos(imp_->reseed_ik_from_actual_ ? imp_->current_joints : imp_->output_joints);
+    imp_->reseed_ik_from_actual_ = false;
     ee.setMpm(imp_->command_pm);
-    if (!arm.inverseKinematics())
+    std::memcpy(imp_->raw_ik_joints, imp_->output_joints, sizeof(imp_->raw_ik_joints));
+    bool ik_ok = !arm.inverseKinematics();
+    if (ik_ok)
     {
+        imp_->anchor_ik_fail_cycles_ = 0;
         arm.getInputPos(imp_->ik_joints);
         for (int i = 0; i < k_joint_num; ++i)
         {
             imp_->ik_joints[i] = wrap_near(imp_->output_joints[i], imp_->ik_joints[i]);
+            if (!std::isfinite(imp_->ik_joints[i])) ik_ok = false;
         }
-        std::memcpy(imp_->output_joints, imp_->ik_joints, sizeof(imp_->output_joints));
+        std::memcpy(imp_->raw_ik_joints, imp_->ik_joints, sizeof(imp_->raw_ik_joints));
     }
-    else if (count() % 500 == 0)
+    if (!ik_ok)
     {
-        mout() << "vr_vel: IK fail, |e_pos|=" << vec3_norm(e_pos_tool)
-               << "m |e_rot|=" << vec3_norm(e_rot_tool) << "rad" << std::endl;
+        if (imp_->anchor_control_enabled_ && imp_->anchor_governor_.control_active())
+        {
+            ++imp_->anchor_ik_fail_cycles_;
+            if (imp_->anchor_ik_fail_cycles_ >= imp_->max_anchor_ik_fail_cycles_)
+            {
+                if (imp_->enter_anchor_fault(
+                        T_base_to_ee,
+                        "ik_failure",
+                        imp_->anchor_shadow_.session_id(),
+                        imp_->anchor_shadow_.anchor_id()))
+                {
+                    mout() << "vr_vel A2.3 fault: repeated IK failure; re-anchor required"
+                           << std::endl;
+                }
+            }
+        }
+        if (count() % 500 == 0)
+        {
+            mout() << "vr_vel: IK fail, |e_pos|=" << vec3_norm(e_pos_tool)
+                   << "m |e_rot|=" << vec3_norm(e_rot_tool) << "rad" << std::endl;
+        }
+        std::memcpy(imp_->ik_joints, imp_->output_joints, sizeof(imp_->ik_joints));
     }
 
+    if (imp_->anchor_control_enabled_)
+    {
+        const bool previously_faulted = imp_->joint_guard_.faulted();
+        if (!ik_ok) imp_->joint_guard_.latch("joint_ik_failure");
+        VrJointGuard::Joints previous{}, velocity{}, requested{}, actual{};
+        for (int i = 0; i < k_joint_num; ++i)
+        {
+            previous[i] = imp_->output_joints[i];
+            velocity[i] = imp_->previous_joint_command_velocity[i];
+            requested[i] = imp_->ik_joints[i];
+            actual[i] = imp_->current_joints[i];
+        }
+        // Release/timeout/fault is intentional braking, not persistent IK demand.
+        // Without stop=true the 2026-09-21 trace latched 50 cycles after release.
+        imp_->joint_guard_result_ = imp_->joint_guard_.step(
+            previous, velocity, requested, actual, anchor_smooth_stopping);
+        std::copy(imp_->joint_guard_result_.position.begin(),
+                  imp_->joint_guard_result_.position.end(), imp_->ik_joints);
+        if (imp_->joint_guard_.faulted())
+        {
+            imp_->enter_anchor_fault(T_base_to_ee, imp_->joint_guard_.fault(),
+                                    imp_->anchor_shadow_.session_id(), imp_->anchor_shadow_.anchor_id());
+            clear_vr_grip_cmd();
+            if (!previously_faulted)
+                mout() << "vr_vel joint guard: " << imp_->joint_guard_.fault()
+                       << " joint=" << imp_->joint_guard_result_.joint
+                       << "; joint braking, stop/recover/restart vr_vel required" << std::endl;
+        }
+        // Accepted joint positions own command_pm. This prevents integrator
+        // windup and keeps the next IK seed on the trajectory actually sent.
+        arm.setInputPos(imp_->ik_joints);
+        if (arm.forwardKinematics())
+        {
+            clear_vr_grip_cmd();
+            mout() << "vr_vel: guarded command FK failed; abort" << std::endl;
+            return -1;
+        }
+        ee.updP();
+        ee.getMpm(imp_->command_pm);
+        if (imp_->joint_guard_result_.limited || imp_->joint_guard_.faulted())
+        {
+            pose_error_tool(imp_->command_pm, previous_command_pm,
+                            imp_->v_cmd_tool, imp_->w_cmd_tool);
+            for (int i = 0; i < 3; ++i)
+            {
+                imp_->v_cmd_tool[i] /= k_dt;
+                imp_->w_cmd_tool[i] /= k_dt;
+            }
+        }
+    }
+
+    std::array<JointDiagnosticResult, k_joint_num> joint_results{};
+    for (int i = 0; i < k_joint_num; ++i)
+    {
+        JointDiagnosticInput input;
+        input.previous_command_position_rad = imp_->output_joints[i];
+        input.command_position_rad = imp_->ik_joints[i];
+        input.previous_command_velocity_rad_s = imp_->previous_joint_command_velocity[i];
+        input.actual_position_rad = imp_->current_joints[i];
+        input.previous_actual_position_rad = imp_->previous_actual_joints[i];
+        input.actual_sample_dt_s =
+            static_cast<double>(count() - imp_->previous_actual_count_) * k_dt;
+        input.has_previous_command_velocity = imp_->joint_diag_history_initialized_;
+        input.has_previous_actual_position = imp_->joint_diag_history_initialized_;
+        const JointDiagnosticLimits limits{
+            k_joint_max_velocity_rad_s[static_cast<std::size_t>(i)],
+            k_joint_max_acceleration_rad_s2[static_cast<std::size_t>(i)],
+            k_joint_max_following_error_rad[static_cast<std::size_t>(i)],
+        };
+        auto& result = joint_results[static_cast<std::size_t>(i)];
+        result = evaluate_joint_diagnostic(input, limits, k_dt);
+        if (imp_->joint_diag_enabled_ && result.abnormal())
+        {
+            const bool first_abnormal_cycle = !imp_->joint_diag_active[i];
+            const bool new_flag =
+                (result.flags & ~imp_->joint_diag_last_flags[i]) != joint_diag_none;
+            if (first_abnormal_cycle || new_flag)
+            {
+                imp_->print_joint_diagnostic_summary(*this, i, result);
+            }
+        }
+        imp_->joint_diag_active[i] = result.abnormal();
+        imp_->joint_diag_last_flags[i] = result.flags;
+        imp_->previous_joint_command_velocity[i] =
+            std::isfinite(result.command_velocity_rad_s)
+            ? result.command_velocity_rad_s
+            : 0.0;
+    }
+
+    if (imp_->joint_diag_enabled_)
+    {
+        imp_->log_joint_trace(*this, count(), ik_ok, joint_results, T_base_to_ee);
+    }
+    if (ik_ok || imp_->anchor_control_enabled_)
+    {
+        std::memcpy(imp_->output_joints, imp_->ik_joints, sizeof(imp_->output_joints));
+    }
+
+    std::memcpy(
+        imp_->previous_actual_joints,
+        imp_->current_joints,
+        sizeof(imp_->previous_actual_joints));
+    imp_->joint_diag_history_initialized_ = true;
+    imp_->previous_actual_count_ = count();
     imp_->apply_joints_to_motors(*this);
     return count();
 }
@@ -698,16 +1423,25 @@ A10VrVelDriver::A10VrVelDriver(const std::string& name) : imp_(new Imp)
         command(),
         "<Command name=\"vr_vel\">"
         "  <GroupParam name=\"group_param\">"
-        "    <Param name=\"kp\" abbreviation=\"p\" default=\"3.0\"/>"
-        "    <Param name=\"kp_rot\" abbreviation=\"r\" default=\"2.0\"/>"
+        "    <Param name=\"kp\" abbreviation=\"p\" default=\"6.0\"/>"
+        "    <Param name=\"kp_rot\" abbreviation=\"r\" default=\"4.8\"/>"
         "    <Param name=\"vmax\" abbreviation=\"v\" default=\"0.12\"/>"
-        "    <Param name=\"wmax\" abbreviation=\"w\" default=\"0.4\"/>"
-        "    <Param name=\"amax\" abbreviation=\"a\" default=\"0.8\"/>"
-        "    <Param name=\"jacc\" abbreviation=\"j\" default=\"1.5\"/>"
+        "    <Param name=\"wmax\" abbreviation=\"w\" default=\"0.32\"/>"
+        "    <Param name=\"amax\" abbreviation=\"a\" default=\"0.4\"/>"
+        "    <Param name=\"jacc\" abbreviation=\"j\" default=\"0.96\"/>"
         "    <Param name=\"pull\" abbreviation=\"l\" default=\"0.995\"/>"
         "    <Param name=\"rot_gain\" abbreviation=\"g\" default=\"1.0\"/>"
         "    <Param name=\"timeout\" abbreviation=\"t\" default=\"0.12\"/>"
         "    <Param name=\"grip_vel\" abbreviation=\"h\" default=\"50\"/>"
+        "    <Param name=\"anchor_control\" abbreviation=\"c\" default=\"1\"/>"
+        "    <Param name=\"ref_vmax\" abbreviation=\"u\" default=\"0.12\"/>"
+        "    <Param name=\"ref_wmax\" abbreviation=\"o\" default=\"0.32\"/>"
+        "    <Param name=\"track_pos\" abbreviation=\"e\" default=\"0.05\"/>"
+        "    <Param name=\"track_rot\" abbreviation=\"d\" default=\"0.35\"/>"
+        "    <Param name=\"track_fault_cycles\" abbreviation=\"f\" default=\"50\"/>"
+        "    <Param name=\"anchor_timeout\" abbreviation=\"s\" default=\"0.25\"/>"
+        "    <Param name=\"ik_fault_cycles\" abbreviation=\"i\" default=\"5\"/>"
+        "    <Param name=\"joint_diag\" abbreviation=\"q\" default=\"1\"/>"
         "  </GroupParam>"
         "</Command>");
 }

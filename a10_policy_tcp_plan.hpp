@@ -18,6 +18,7 @@ class A10PolicyTcpDriver : public aris::core::CloneObject<A10PolicyTcpDriver, ar
 public:
     auto prepareNrt() -> void override;
     auto executeRT() -> int override;
+    auto collectNrt() -> void override;
 
     virtual ~A10PolicyTcpDriver();
     explicit A10PolicyTcpDriver(const std::string& name = "A10PolicyTcpDriver");
