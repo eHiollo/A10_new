@@ -15,6 +15,7 @@
 #include "a10_gripper_bridge.hpp"
 #include "a10_tcp_server.hpp"
 #include "a10_startup_login.hpp"
+#include "a10_startup_config.hpp"
 #include "a10_vr_plan.hpp"
 #include "gripper.hpp"
 
@@ -32,66 +33,25 @@
 A10TcpServer* g_tcp_server = nullptr;
 BusServo* g_gripper = nullptr;
 
-auto xmlpath = std::filesystem::absolute(".");	//获取当前工程所在的路径
-auto logpath = std::filesystem::absolute(".");
-const std::string xmlfile = "kaanh.xml";
-const std::string logfolder = "log";
-
-#ifndef KAANH_SOURCE_DIR
-#define KAANH_SOURCE_DIR ""
-#endif
-
-auto resolve_kaanh_xml() -> std::filesystem::path
-{
-    std::error_code ec;
-    std::vector<std::filesystem::path> candidates;
-
-    if constexpr (KAANH_SOURCE_DIR[0] != '\0')
-    {
-        candidates.emplace_back(std::filesystem::path(KAANH_SOURCE_DIR) / xmlfile);
-    }
-
-    const auto cwd = std::filesystem::current_path(ec);
-    if (!ec)
-    {
-        for (auto p = cwd; ; p = p.parent_path())
-        {
-            candidates.emplace_back(p / xmlfile);
-            if (p == p.parent_path())
-            {
-                break;
-            }
-        }
-    }
-
-    for (const auto& c : candidates)
-    {
-        std::error_code fec;
-        if (std::filesystem::exists(c, fec) && !fec)
-        {
-            const auto sz = std::filesystem::file_size(c, fec);
-            if (!fec && sz > 0)
-            {
-                return std::filesystem::absolute(c);
-            }
-        }
-    }
-    throw std::runtime_error("kaanh.xml not found (expected repo root kaanh.xml)");
-}
-
 int main(int argc, char *argv[]){
-	xmlpath = xmlpath / xmlfile;
-	logpath = logpath / logfolder;
-
-	auto& cs = aris::server::ControlServer::instance();
-	auto port = argc < 2 ? 5866 : std::stoi(argv[1]);
-	auto path = argc >= 3 ? std::filesystem::path(argv[2]) : resolve_kaanh_xml();
-	auto logp = argc >= 4 ? std::filesystem::path(argv[3]) : logpath;
-
-	std::cout << "port:" << port << std::endl;
-	std::cout << "xmlpath:" << xmlpath << std::endl;
-	std::cout << "path:" << path << std::endl;
-	std::cout << "logfolder:" << logp << std::endl;
+    std::filesystem::path path, logp;
+    try
+    {
+        const auto executable_dir = a10_startup::executable_directory(argv[0]);
+        path = a10_startup::xml_path(executable_dir,
+            argc >= 3 ? std::filesystem::path(argv[2]) : std::filesystem::path{});
+        logp = argc >= 4 ? std::filesystem::absolute(argv[3]) : executable_dir / "log";
+    }
+    catch (const std::exception& error)
+    {
+        std::cerr << "startup: " << error.what() << std::endl;
+        return 1;
+    }
+    auto& cs = aris::server::ControlServer::instance();
+    if (argc >= 2)
+        std::cout << "startup: legacy port argument is ignored; interface ports come from XML" << std::endl;
+    std::cout << "startup: XML=" << path << std::endl;
+    std::cout << "startup: logfolder=" << logp << std::endl;
 
 	// 重载Aris log接口
 	aris::core::setLogMethod([](aris::core::LogData data)->void {
@@ -110,6 +70,16 @@ int main(int argc, char *argv[]){
 	});
 
 	aris::core::fromXmlFile(cs, path);
+    for (auto& interface : cs.interfacePool())
+    {
+        if (auto* web = dynamic_cast<aris::server::WebInterface*>(&interface))
+            std::cout << "startup: " << web->name() << " WebSocket port="
+                      << web->socket().port() << std::endl;
+        else if (auto* http = dynamic_cast<aris::server::HttpInterface*>(&interface))
+            std::cout << "startup: " << http->name() << " HTTP port="
+                      << http->port() << std::endl;
+    }
+
 
     try
     {
@@ -390,6 +360,15 @@ int main(int argc, char *argv[]){
     
 	//Start Web Socket
 	cs.open();
+    for (auto& interface : cs.interfacePool())
+        if (auto* web = dynamic_cast<aris::server::WebInterface*>(&interface))
+        {
+            const auto state = web->socket().state();
+            const char* label = state == aris::core::Socket::State::WORKING ? "connected"
+                : state == aris::core::Socket::State::WAITING_FOR_CONNECTION ? "waiting_for_connection" : "idle";
+            std::cout << "startup: " << web->name() << " port=" << web->socket().port()
+                      << " state=" << label << std::endl;
+        }
 
 	//Receive Command
 	cs.runCmdLine();

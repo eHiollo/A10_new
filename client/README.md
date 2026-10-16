@@ -1,5 +1,18 @@
 # client（VLA / OpenPI 桥接）
 
+## 固定启动入口与端口（2026-10-16）
+
+统一入口为 `/home/kaanh/A10_new/build/bin` 下的 `sudo ./kaanhbin`。
+控制器默认只读取可执行文件旁的 `kaanh.xml`，缺失或为空立即报错，不再回退到源码或父目录。
+启动会打印 XML 绝对路径、WebSocket/HTTP 端口和 WebSocket 状态；旧的首个端口参数仅为位置兼容，不覆盖 XML。
+
+当前配置：示教器 WebSocket 5867、另两个 WebSocket 接口 5888/5999、HTTP 8001、
+VLA/VR TCP 8080、Modbus TCP 502。5866 不在当前配置中。
+
+查看连接应使用 `sudo ss -antp`，同时检查 LISTEN 和 ESTAB。已连接的 5867
+可能不出现在仅列监听的 `ss -lntp` 中；不能据此判断端口未启动。
+此入口的构建产物来自 kaanh_test；仓库根目录仍检出 kaanh_rtc，直接在根目录旧 build 中编译会覆盖为旧分支程序。
+
 ## kaanh 整合版（2026-10-15）
 
 保留 2026-10-09 RTC 实机默认值和 async/sync/pipeline。日志由控制器

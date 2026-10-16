@@ -76,7 +76,6 @@ endif()
 
 include_directories(${PROJECT_SOURCE_DIR})
 add_executable(kaanhbin ${KAANHBIN_SOURCES})
-target_compile_definitions(kaanhbin PRIVATE KAANH_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_include_directories(kaanhbin PUBLIC
     ${PROJECT_BINARY_DIR}
     ${rtb_INCLUDE_DIRS}
