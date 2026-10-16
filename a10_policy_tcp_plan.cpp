@@ -1,3 +1,5 @@
+#include "a10_follower.hpp"
+#include "a10_motion_lease.hpp"
 #include "a10_policy_tcp_plan.hpp"
 
 #include "kaanh/general/macro.hpp"
@@ -325,6 +327,7 @@ bool legacy_target_changed(const std::vector<double>& tq, const std::vector<doub
 
 struct A10PolicyTcpDriver::Imp
 {
+    std::shared_ptr<a10_follower::MotionLease> motion_lease_;
     std::uint64_t log_session_token_{0};
     JointSegment batch_seg;
     JointSegment legacy_seg;
@@ -797,6 +800,7 @@ struct A10PolicyTcpDriver::Imp
 
 auto A10PolicyTcpDriver::prepareNrt() -> void
 {
+    auto motion_lease = a10_follower::MotionLease::acquire(a10_follower::MotionOwner::Policy);
     const double log_value = doubleParam("log");
     if (log_value != 0.0 && log_value != 1.0)
         throw std::invalid_argument("policy --log must be 0 or 1");
@@ -829,6 +833,7 @@ auto A10PolicyTcpDriver::prepareNrt() -> void
     {
         m = aris::plan::Plan::CHECK_NONE | aris::plan::Plan::NOT_CHECK_POS_CONTINUOUS_SECOND_ORDER;
     }
+    imp_->motion_lease_ = std::move(motion_lease);
 }
 
 auto A10PolicyTcpDriver::executeRT() -> int
@@ -1120,11 +1125,13 @@ auto A10PolicyTcpDriver::collectNrt() -> void
         g_tcp_server->policy_running.store(false);
         g_tcp_server->policy_motion_settling.store(false);
     }
+    imp_->motion_lease_.reset();
 }
 KAANH_DEFINE_BIG_FOUR_CPP(A10PolicyTcpDriver)
 
 auto A10PolicyTcpCliStop::prepareNrt() -> void
 {
+    a10_follower::request_stop();
     if (g_tcp_server != nullptr) g_tcp_server->policy_log_state().stop();
     for (auto& m : motorOptions())
     {

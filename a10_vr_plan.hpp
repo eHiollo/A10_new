@@ -34,6 +34,7 @@ class A10VrDriver : public aris::core::CloneObject<A10VrDriver, aris::plan::Plan
 public:
     auto prepareNrt() -> void override;
     auto executeRT() -> int override;
+    auto collectNrt() -> void override;
 
     virtual ~A10VrDriver();
     explicit A10VrDriver(const std::string& name = "A10VrDriver");

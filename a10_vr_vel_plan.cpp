@@ -1,3 +1,4 @@
+#include "a10_motion_lease.hpp"
 #include "a10_vr_vel_plan.hpp"
 
 #include "kaanh/general/macro.hpp"
@@ -345,6 +346,7 @@ void pull_target_toward_actual(double* target_pm, const double* actual_pm, doubl
 
 struct A10VrVelDriver::Imp
 {
+    std::shared_ptr<a10_follower::MotionLease> motion_lease_;
     double target_pm[16]{};
     double command_pm[16]{};
 
@@ -764,6 +766,7 @@ struct A10VrVelDriver::Imp
 
 auto A10VrVelDriver::prepareNrt() -> void
 {
+    auto motion_lease = a10_follower::MotionLease::acquire(a10_follower::MotionOwner::VrVel);
     imp_->inited_ = false;
     imp_->idle_coast_ = false;
     imp_->homing_ = false;
@@ -809,6 +812,12 @@ auto A10VrVelDriver::prepareNrt() -> void
         m = aris::plan::Plan::CHECK_NONE | aris::plan::Plan::NOT_CHECK_POS_CONTINUOUS_SECOND_ORDER;
     }
     clear_vr_grip_cmd();
+    imp_->motion_lease_ = std::move(motion_lease);
+}
+
+auto A10VrVelDriver::collectNrt() -> void
+{
+    imp_->motion_lease_.reset();
 }
 
 auto A10VrVelDriver::executeRT() -> int

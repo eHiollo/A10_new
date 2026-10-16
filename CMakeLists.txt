@@ -43,6 +43,7 @@ set(KAANHBIN_SOURCES
     a10_tcp_server.cpp
     a10_anchor_protocol.cpp
     a10_policy_tcp_plan.cpp
+    a10_follower.cpp
     a10_vr_plan.cpp
     a10_vr_vel_plan.cpp
     a10_gripper_bridge.cpp
@@ -115,4 +116,19 @@ if(A10_BUILD_STARTUP_LOGIN_TEST)
         BUILD_RPATH "/opt/etherlab/lib;/usr/kaanhbot/kaanhbot-2.5.7/lib/release;/usr/kaanh/kaanh-2.5.7/lib/release;/usr/aris/aris-2.5.7/lib/release"
     )
     add_test(NAME a10_startup_login COMMAND a10_startup_login_test)
+endif()
+
+option(A10_BUILD_FOLLOWER_TESTS "Build hardware-free follower tests" OFF)
+if(A10_BUILD_FOLLOWER_TESTS)
+    enable_testing()
+    add_executable(a10_follower_core_test tests/a10_follower_core_test.cpp)
+    target_include_directories(a10_follower_core_test PRIVATE ${kaanhbot_INCLUDE_DIRS})
+    target_link_libraries(a10_follower_core_test PRIVATE pthread)
+    add_test(NAME a10_follower_core COMMAND a10_follower_core_test)
+    add_executable(a10_follower_sdk_test tests/a10_follower_sdk_test.cpp a10_follower.cpp)
+    target_include_directories(a10_follower_sdk_test PRIVATE ${rtb_INCLUDE_DIRS})
+    target_link_libraries(a10_follower_sdk_test PRIVATE ${kaanhbot_LIBRARIES})
+    set_target_properties(a10_follower_sdk_test PROPERTIES BUILD_RPATH "/opt/etherlab/lib;/usr/kaanhbot/kaanhbot-2.5.7/lib/release;/usr/kaanh/kaanh-2.5.7/lib/release;/usr/aris/aris-2.5.7/lib/release")
+    add_test(NAME a10_follower_sdk COMMAND a10_follower_sdk_test)
+    add_test(NAME a10_follower_xml COMMAND kaanhbin --check-config ${PROJECT_SOURCE_DIR}/kaanh.xml)
 endif()

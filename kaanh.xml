@@ -1495,16 +1495,15 @@
                     <GroupParam name="group_param"/>
                 </Command>
             </kaanh.FollowerAjTg>
-            <kaanh.FollowerAjAbsolute2 name="plan">
+            <A10JointFollower name="plan">
                 <Command __prop_name__="command" name="follower_aj">
                     <GroupParam name="group_param">
-                        <Param name="max_vel" default="1.5"/>
-                        <Param name="max_acc" default="4"/>
-                        <Param name="max_dec" default="4"/>
-                        <Param name="max_jerk" default="10.0"/>
+                        <Param name="max_vel" default="0.3"/>
+                        <Param name="max_acc" default="1.5"/>
+                        <Param name="max_dec" default="1.5"/>
                     </GroupParam>
                 </Command>
-            </kaanh.FollowerAjAbsolute2>
+            </A10JointFollower>
             <kaanh.FollowerCart name="plan">
                 <Command __prop_name__="command" name="follower_cart">
                     <GroupParam name="group_param"/>
@@ -1889,7 +1888,7 @@
                     <DistributeRule module="kaanh::package::ConveyorManager" cmds="conveyor_query;conveyor_ctrl;get_conveyor_vel;camera_calib;conveyor_calib;conveyor_edit;get_tolerance;cal_circle;clear_count;set_tolerance;set_conveyor_vel"/>
                     <DistributeRule module="ModbusRtuManager" cmds="rtuset;rtuget"/>
                     <DistributeRule module="IoManager" cmds="ioquery;ioctrl"/>
-                    <DistributeRule module="UDPFollower" cmds="stop_follower;start_follower"/>
+                    <DistributeRule module="UDPFollower" cmds="follower_aj;stop_follower;start_follower;follower_config"/>
                     <DistributeRule module="kaanh::package::Current" cmds="write_fr_static_index;read_max_static_vel;read_fr_dynamic_index;write_collision_detection_sensitivity;write_collision_detection_state;write_fr_dynamic_index;write_max_static_vel;write_torque;collision_detection_ctrl;read_fr_static_index;read_torque;read_collision_detection_sensitivity;read_collision_detection_state"/>
                     <DistributeRule module="Trajfc" cmds="trajfc"/>
                     <DistributeRule module="Web3DModel" cmds="get_3dmodel;set_3dname;set_3dpos"/>
@@ -4007,7 +4006,7 @@
                 </StringVec>
             </ExternalAuto>
             <SplcController name="SplcController" auto_start="false"/>
-            <UDPFollower name="UDPFollower">
+            <A10UdpFollower name="UDPFollower">
                 <FollowerParamPool __prop_name__="follower_param_pool">
                     <FollowerAjParam tg_id="0">
                         <SocketServer __prop_name__="socket_server" connect_type="UDP" port="9999"/>
@@ -4016,7 +4015,7 @@
                         <SocketServer __prop_name__="socket_server" connect_type="UDP" port="9998"/>
                     </FollowerCartParam>
                 </FollowerParamPool>
-            </UDPFollower>
+            </A10UdpFollower>
             <UserSlave name="UserSlave">
                 <SlaveParamPool __prop_name__="_slave_param_pool"/>
             </UserSlave>

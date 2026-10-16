@@ -16,6 +16,7 @@
 #include "a10_tcp_server.hpp"
 #include "a10_startup_login.hpp"
 #include "a10_startup_config.hpp"
+#include "a10_follower.hpp"
 #include "a10_vr_plan.hpp"
 #include "gripper.hpp"
 
@@ -34,10 +35,12 @@ A10TcpServer* g_tcp_server = nullptr;
 BusServo* g_gripper = nullptr;
 
 int main(int argc, char *argv[]){
+    const bool check_config = argc >= 2 && std::string_view(argv[1]) == "--check-config";
     std::filesystem::path path, logp;
     try
     {
         const auto executable_dir = a10_startup::executable_directory(argv[0]);
+        a10_follower::set_config_directory(executable_dir);
         path = a10_startup::xml_path(executable_dir,
             argc >= 3 ? std::filesystem::path(argv[2]) : std::filesystem::path{});
         logp = argc >= 4 ? std::filesystem::absolute(argv[3]) : executable_dir / "log";
@@ -48,7 +51,7 @@ int main(int argc, char *argv[]){
         return 1;
     }
     auto& cs = aris::server::ControlServer::instance();
-    if (argc >= 2)
+    if (argc >= 2 && !check_config)
         std::cout << "startup: legacy port argument is ignored; interface ports come from XML" << std::endl;
     std::cout << "startup: XML=" << path << std::endl;
     std::cout << "startup: logfolder=" << logp << std::endl;
@@ -80,6 +83,13 @@ int main(int argc, char *argv[]){
                       << http->port() << std::endl;
     }
 
+
+    // Offline configuration validation exits before cs.init(), sockets, USB,
+    // EtherCAT startup, login, or any motor command.
+    if (check_config) {
+        std::cout << "startup: configuration valid (controller not started)" << std::endl;
+        return 0;
+    }
 
     try
     {

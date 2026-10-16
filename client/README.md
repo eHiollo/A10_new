@@ -1,5 +1,10 @@
 # client（VLA / OpenPI 桥接）
 
+## 新关节 follower
+
+兼容前端的 `follower_aj` / `stop_follower` / UDP `jp` 已改用本项目跟踪器，支持在线调速与显式保存。
+启停、参数单位及验证方式见 [关节 follower 说明](../doc/follower_axis.md)。
+
 ## 固定启动入口与端口（2026-10-16）
 
 统一入口为 `/home/kaanh/A10_new/build/bin` 下的 `sudo ./kaanhbin`。

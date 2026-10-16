@@ -1,3 +1,4 @@
+#include "a10_motion_lease.hpp"
 #include "a10_vr_plan.hpp"
 
 #include "kaanh/general/macro.hpp"
@@ -229,6 +230,7 @@ void pm_pose_error(const double* pm_ref, const double* pm_now, double& pos_err, 
 
 struct A10VrDriver::Imp
 {
+    std::shared_ptr<a10_follower::MotionLease> motion_lease_;
     rtb::plan::SE3Follower follower;
 
     double target_pm[16]{};
@@ -265,6 +267,7 @@ struct A10VrDriver::Imp
 
 auto A10VrDriver::prepareNrt() -> void
 {
+    auto motion_lease = a10_follower::MotionLease::acquire(a10_follower::MotionOwner::Vr);
     imp_->inited_ = false;
     imp_->consumed_ee_delta_seq_ = 0;
     g_a10_vr_stop_requested.store(false, std::memory_order_release);
@@ -280,6 +283,12 @@ auto A10VrDriver::prepareNrt() -> void
     imp_->follower.setMaxAngVel(imp_->max_ang_vel_);
     imp_->follower.setMaxAngAcc(imp_->max_ang_acc_);
     clear_vr_grip_cmd();
+    imp_->motion_lease_ = std::move(motion_lease);
+}
+
+auto A10VrDriver::collectNrt() -> void
+{
+    imp_->motion_lease_.reset();
 }
 
 auto A10VrDriver::executeRT() -> int

@@ -55,3 +55,13 @@ Python 40 项通过。C++ 9 个离线测试程序通过：锚点/reset 协议、
 运行中的控制器不重启；新的构建产物更新到统一入口，下一次启动生效。
 
 启动路径离线测试与完整控制器构建通过；实际新可执行文件放到缺少 XML 的临时目录运行，验证其在启动控制器之前明确报错退出，未回退源码配置。统一入口仅更新二进制，保留现场 build/bin/kaanh.xml 的现有内容。
+
+## 2026-10-16 关节 follower 重写
+
+`follower_aj` 改为 A10JointFollower，UDPFollower 扩展为 A10UdpFollower，保留原 SDK SocketServer 封装、UDP 9999、`get` 的 `follower_msg` 字段及笛卡尔 follower。新增 `follower_config` 在线配置和显式保存；详见 [使用说明](follower_axis.md)。
+
+控制采用最新有效目标覆盖，2ms 周期连续跟踪，断流后完成最后目标并保持。速度/加速度/减速度默认 0.3/1.5/1.5（rad/s、rad/s²），复用 VR 独立关节保护。停止成功回复不提前改变 running_state；完成制动和反馈停止后才发布未运行。与 policy/VR 增加运动所有权互斥，其既有控制算法不变。
+
+已通过完整构建、4 项 CTest（登录、跟踪/协议/配置/并发、SDK 模拟 Plan 生命周期、完整 XML 离线加载）、10 个既有离线 C++ 程序和 40 项 Python 回归。SDK 测试使用显式模拟电机，不初始化总线、不启动真实控制器、不发送运动指令。实机效果待用户验证。
+
+部署时备份 build/bin 的程序和现场 XML，仅迁移 follower Plan/模块及 Distributor 路由；对 XML 其余部分作结构比较，保留端口、标定与其他配置。现场进程不重启，新版本下次启动生效。
